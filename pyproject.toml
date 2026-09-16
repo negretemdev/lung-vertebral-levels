@@ -1,0 +1,18 @@
+[project]
+name = "lung-vertebral-levels"
+version = "0.1.0"
+description = "Batch pipeline: TotalSegmentator lung lobes + vertebrae on chest CT DICOMs, craniocaudal lung length and vertebral level spans."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "totalsegmentator>=2.4",
+    "pydicom>=2.4",
+    "pylibjpeg[libjpeg,openjpeg,rle]>=2.0",
+    "python-gdcm>=3.0.24",
+    "nibabel>=5.2",
+    "numpy",
+    "scipy",
+    "SimpleITK>=2.3",
+    "tqdm",
+    "napari[all]>=0.9.0",
+]
