@@ -12,10 +12,16 @@ wheels/
 # Generated data (never commit patient data or results)
 fake_case/
 output/
+diag_*/
 *.nii.gz
 *.dcm
+*.report.json
 pipeline.log
 results.csv
 incident_report.md
 bad_case.txt
 good_case.txt
+log/
+
+# OS / editor
+.DS_Store

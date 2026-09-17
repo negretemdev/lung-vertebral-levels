@@ -5,14 +5,38 @@ description = "Batch pipeline: TotalSegmentator lung lobes + vertebrae on chest 
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "totalsegmentator>=2.4",
+    "totalsegmentator>=2.18",
     "pydicom>=2.4",
     "pylibjpeg[libjpeg,openjpeg,rle]>=2.0",
     "python-gdcm>=3.0.24",
     "nibabel>=5.2",
     "numpy",
     "scipy",
+    "scikit-image>=0.25",
     "SimpleITK>=2.3",
     "tqdm",
-    "napari[all]>=0.9.0",
+    "psutil",
+    # torch is used directly (device selection); torchvision is pulled in by timm via nnunetv2.
+    # Both are declared so that the Windows CUDA index source below applies to them.
+    "torch>=2.13",
+    "torchvision",
 ]
+
+[project.optional-dependencies]
+# napari QC viewer (Qt stack). Install with `uv sync --extra viz`; not needed on the GPU batch machine.
+viz = ["napari[all]>=0.9.0"]
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+# Windows: the PyPI torch wheels are CPU-only there, so torch (and torchvision,
+# which timm pulls in) come from the PyTorch CUDA 13.0 index on Windows.
+# Needs an NVIDIA driver >= 580 (check with `nvidia-smi`). macOS/Linux keep PyPI.
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu130", marker = "sys_platform == 'win32'" }]
+torchvision = [{ index = "pytorch-cu130", marker = "sys_platform == 'win32'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true

@@ -10,8 +10,45 @@ lung, and both combined. Built for Apple Silicon (`device="mps"`).
 Requires [uv](https://docs.astral.sh/uv/). From the repo root:
 
 ```bash
-uv sync
+uv sync                 # pipeline only
+uv sync --extra viz     # + napari for the QC viewer (test.py); not needed on the batch machine
 ```
+
+### Windows / NVIDIA machine
+
+- `uv sync` on Windows installs the CUDA 13.0 build of torch from the PyTorch
+  index (declared in `pyproject.toml`; PyPI's Windows torch is CPU-only). It
+  needs an NVIDIA driver 580 or newer: run `nvidia-smi` and check that the
+  "CUDA Version" in its header is 13.0 or higher. Older driver: update it.
+- Model weights: TotalSegmentator downloads them on first use into
+  `%USERPROFILE%\.totalsegmentator` (about 3 GB for all tasks used here). For
+  an offline machine copy the whole `~/.totalsegmentator` folder from the Mac
+  after running the diagnostic there, which downloads every needed model.
+- `--device auto` picks CUDA when available, then Apple MPS, then CPU.
+
+## Phase 1: diagnostic on one case (before any batch)
+
+`diagnose_totalseg.py` runs every TotalSegmentator task of the extended
+pipeline once on ONE case, times each task, and checks the masks (does the
+airway mask reach the carina, are the `vertebrae_pp` labels bodies only, is
+the CT stored in HU, how long does each model take on this machine, ...).
+Its printed output contains no identifiers and can be pasted back whole. The
+`--out` folder receives the case's CT and masks: that is patient data, keep it
+with the data and never inside the repo.
+
+```bash
+# MacBook (Apple GPU): one patient folder, or a flat export + PatientID
+uv run python diagnose_totalseg.py --dicom "/Volumes/DRIVE/cohort/PATIENT_FOLDER" --out "/Volumes/DRIVE/diag_case1"
+uv run python diagnose_totalseg.py --dicom "/Volumes/DRIVE/export" --patient-id "ID" --out "/Volumes/DRIVE/diag_case1"
+
+# Windows / 4090: same command with --device gpu
+uv run python diagnose_totalseg.py --dicom "D:\cohort\PATIENT_FOLDER" --out "D:\diag_case1" --device gpu
+```
+
+Options: `--fast-too` (also time the 3 mm model), `--variants` (resampling
+variants; adds several full model runs), `--tasks total,lung_vessels` (subset),
+`--skip-inference` (re-analyse masks already in `--out`), `--json summary.json`.
+The first run also downloads the model weights (untimed).
 
 ## Choosing the input and output folders
 
