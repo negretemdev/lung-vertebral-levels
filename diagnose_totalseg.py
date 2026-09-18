@@ -386,9 +386,12 @@ def download_weights(runs: list[tuple[str, dict]]) -> None:
             say(f"  dataset {i}: DOWNLOAD FAILED ({type(e).__name__}: {str(e)[:120]}) -- offline? the timed run will retry")
 
 
-def run_tasks(runs: list[tuple[str, dict]], ct_path: Path, out: Path, device: str, skip: bool) -> list[dict]:
+def run_tasks(runs: list[tuple[str, dict]], ct_path: Path, out: Path, device: str, skip: bool,
+              nr_thr_saving: int = 6, nr_thr_resamp: int = 1) -> list[dict]:
     section("RUNTIME PER TASK" + (" (skip-inference: reading existing masks)" if skip else ""))
     from totalsegmentator.python_api import totalsegmentator
+    say(f"  settings: nr_thr_saving={nr_thr_saving} (nnU-Net export worker processes per model call) | "
+        f"nr_thr_resamp={nr_thr_resamp} | robust_crop=True")
 
     rows: list[dict] = []
     for name, kw in runs:
@@ -397,7 +400,8 @@ def run_tasks(runs: list[tuple[str, dict]], ct_path: Path, out: Path, device: st
         row = dict(name=name, task=kw["task"], device=device, seconds=float("nan"), ok=False,
                    retried_cpu=False, peak_rss_mb=float("nan"), error="", fast=bool(kw.get("fast", False)),
                    resampling_order=kw.get("resampling_order", 1),
-                   higher_order_resampling=bool(kw.get("higher_order_resampling", False)))
+                   higher_order_resampling=bool(kw.get("higher_order_resampling", False)),
+                   nr_thr_saving=nr_thr_saving, nr_thr_resamp=nr_thr_resamp)
         if skip:
             row["ok"] = mask.exists()
             if report.exists():
@@ -422,6 +426,7 @@ def run_tasks(runs: list[tuple[str, dict]], ct_path: Path, out: Path, device: st
                         fast=bool(kw.get("fast", False)), roi_subset=kw.get("roi_subset"),
                         resampling_order=kw.get("resampling_order", 1),
                         higher_order_resampling=bool(kw.get("higher_order_resampling", False)),
+                        nr_thr_saving=nr_thr_saving, nr_thr_resamp=nr_thr_resamp,
                     )
                 if not mask.exists():
                     raise RuntimeError("TotalSegmentator finished but produced no output file")
@@ -459,12 +464,12 @@ def run_tasks(runs: list[tuple[str, dict]], ct_path: Path, out: Path, device: st
 
 def print_runtime_table(rows: list[dict]) -> None:
     section("RUNTIME TABLE")
-    say(f"{'run':28s} {'task':26s} {'device':8s} {'seconds':>8s} {'min':>6s} {'ro':>3s} {'ho':>3s} {'fast':>5s} {'peakRSS_MB':>10s}  note")
+    say(f"{'run':28s} {'task':26s} {'device':8s} {'seconds':>8s} {'min':>6s} {'ro':>3s} {'ho':>3s} {'fast':>5s} {'nts':>4s} {'peakRSS_MB':>10s}  note")
     for r in rows:
         note = r.get("error", "") or ("cpu retry" if r.get("retried_cpu") else "")
         say(f"{r['name']:28s} {r['task']:26s} {str(r['device']):8s} {fmt(r['seconds'], 1):>8s} "
             f"{fmt(r['seconds'] / 60 if r['ok'] and not math.isnan(r['seconds']) else float('nan'), 1):>6s} "
-            f"{r['resampling_order']:>3d} {str(r['higher_order_resampling'])[0]:>3s} {str(r['fast'])[0]:>5s} "
+            f"{r['resampling_order']:>3d} {str(r['higher_order_resampling'])[0]:>3s} {str(r['fast'])[0]:>5s} {r.get('nr_thr_saving', 6):>4d} "
             f"{fmt(r['peak_rss_mb'], 0):>10s}  {note}")
     say("(peak RSS is the process high-water mark up to that task, not a per-task figure)")
 
@@ -747,6 +752,10 @@ def main() -> int:
     ap.add_argument("--variants", action="store_true", help="also time resampling variants")
     ap.add_argument("--skip-inference", action="store_true", help="analyse existing masks in --out only")
     ap.add_argument("--no-download", action="store_true", help="skip the untimed weight pre-download")
+    ap.add_argument("--nr-thr-saving", type=int, default=6,
+                    help="TotalSegmentator nr_thr_saving = nnU-Net export worker processes per model call "
+                         "(TotalSegmentator default 6; 1 avoids starting 6 python processes per model call)")
+    ap.add_argument("--nr-thr-resamp", type=int, default=1, help="TotalSegmentator nr_thr_resamp (default 1)")
     ap.add_argument("--json", type=Path, default=None, help="write the identifier-free summary here")
     args = ap.parse_args()
     args.tasks = [t.strip() for t in args.tasks.split(",") if t.strip()]
@@ -772,7 +781,8 @@ def main() -> int:
     runs = build_runs(args, roi, roi_no_trachea, cuda=bool(env.get("cuda")))
     if not args.skip_inference and not args.no_download:
         download_weights(runs)
-    rows = run_tasks(runs, ct_path, args.out, device, args.skip_inference)
+    rows = run_tasks(runs, ct_path, args.out, device, args.skip_inference,
+                     nr_thr_saving=args.nr_thr_saving, nr_thr_resamp=args.nr_thr_resamp)
 
     mask_paths = {name: args.out / f"case_{name}.nii.gz" for name, _ in runs if name in ALL_TASKS}
     summary = safe(analyze, "analysis", ct_path, mask_paths) or {}
