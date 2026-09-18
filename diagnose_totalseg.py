@@ -32,7 +32,9 @@ import logging
 import math
 import platform
 import shutil
+import subprocess
 import sys
+import threading
 import time
 import traceback
 from pathlib import Path
@@ -181,6 +183,45 @@ def peak_rss_mb() -> float:
             return psutil.Process().memory_info().peak_wset / 1e6
         except Exception:  # noqa: BLE001
             return float("nan")
+
+
+class GpuSampler:
+    """Samples nvidia-smi utilisation / memory every 0.5 s in a background thread."""
+
+    def __init__(self) -> None:
+        self.samples: list[tuple[float, float]] = []
+        self._stop = threading.Event()
+        self.thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if shutil.which("nvidia-smi") is None:
+            return
+
+        def loop() -> None:
+            while not self._stop.is_set():
+                try:
+                    out = subprocess.run(["nvidia-smi", "--query-gpu=utilization.gpu,memory.used",
+                                          "--format=csv,noheader,nounits"],
+                                         capture_output=True, text=True, timeout=5).stdout.strip().splitlines()
+                    u, m = out[0].split(",")
+                    self.samples.append((float(u), float(m)))
+                except Exception:  # noqa: BLE001
+                    pass
+                self._stop.wait(0.5)
+
+        self.thread = threading.Thread(target=loop, daemon=True)
+        self.thread.start()
+
+    def stop(self) -> tuple[float, float, float]:
+        """(mean utilisation %, max utilisation %, max memory used GB); nan without nvidia-smi."""
+        self._stop.set()
+        if self.thread is not None:
+            self.thread.join(timeout=3)
+        if not self.samples:
+            return float("nan"), float("nan"), float("nan")
+        u = [x[0] for x in self.samples]
+        m = [x[1] for x in self.samples]
+        return float(np.mean(u)), float(max(u)), float(max(m) / 1024)
 
 
 def resolve_device(arg: str) -> str:
@@ -401,7 +442,9 @@ def run_tasks(runs: list[tuple[str, dict]], ct_path: Path, out: Path, device: st
                    retried_cpu=False, peak_rss_mb=float("nan"), error="", fast=bool(kw.get("fast", False)),
                    resampling_order=kw.get("resampling_order", 1),
                    higher_order_resampling=bool(kw.get("higher_order_resampling", False)),
-                   nr_thr_saving=nr_thr_saving, nr_thr_resamp=nr_thr_resamp)
+                   nr_thr_saving=nr_thr_saving, nr_thr_resamp=nr_thr_resamp,
+                   gpu_util_mean=float("nan"), gpu_util_max=float("nan"), gpu_mem_gb=float("nan"),
+                   torch_gpu_peak_gb=float("nan"))
         if skip:
             row["ok"] = mask.exists()
             if report.exists():
@@ -417,6 +460,14 @@ def run_tasks(runs: list[tuple[str, dict]], ct_path: Path, out: Path, device: st
         for dev in devices:
             mask.unlink(missing_ok=True)
             say(f"  running {name} on {dev} ...")
+            sampler = GpuSampler()
+            if dev.startswith("gpu"):
+                sampler.start()
+                try:
+                    import torch
+                    torch.cuda.reset_peak_memory_stats()
+                except Exception:  # noqa: BLE001
+                    pass
             t0 = time.monotonic()
             try:
                 with redacted_output():
@@ -431,8 +482,17 @@ def run_tasks(runs: list[tuple[str, dict]], ct_path: Path, out: Path, device: st
                 if not mask.exists():
                     raise RuntimeError("TotalSegmentator finished but produced no output file")
                 row.update(seconds=round(time.monotonic() - t0, 1), ok=True, device=dev, retried_cpu=(dev != device), error="")
+                um, ux, mg = sampler.stop()
+                row.update(gpu_util_mean=um, gpu_util_max=ux, gpu_mem_gb=mg)
+                if dev.startswith("gpu"):
+                    try:
+                        import torch
+                        row["torch_gpu_peak_gb"] = torch.cuda.max_memory_allocated() / 1e9
+                    except Exception:  # noqa: BLE001
+                        pass
                 break
             except Exception as e:  # noqa: BLE001
+                sampler.stop()
                 row["error"] = f"{type(e).__name__}: {str(e)[:160]}"
                 row["seconds"] = round(time.monotonic() - t0, 1)
                 say(f"  {name} FAILED on {dev} after {row['seconds']} s: {row['error']}")
@@ -458,20 +518,24 @@ def run_tasks(runs: list[tuple[str, dict]], ct_path: Path, out: Path, device: st
         rows.append(row)
         status = "ok" if row["ok"] else "FAILED"
         say(f"  {name:28s} {status:6s} {fmt(row['seconds'], 1):>8s} s = {fmt(row['seconds'] / 60 if row['ok'] else float('nan'), 1):>5s} min"
-            f" | device {row['device']}{' (cpu retry)' if row['retried_cpu'] else ''} | peak RSS so far {fmt(row['peak_rss_mb'], 0)} MB")
+            f" | device {row['device']}{' (cpu retry)' if row['retried_cpu'] else ''} | peak RSS so far {fmt(row['peak_rss_mb'], 0)} MB"
+            + (f" | GPU util mean {fmt(row['gpu_util_mean'], 0)} % max {fmt(row['gpu_util_max'], 0) } % | GPU mem max {fmt(row['gpu_mem_gb'], 1)} GB"
+               f" | torch peak {fmt(row['torch_gpu_peak_gb'], 1)} GB" if not math.isnan(row['gpu_util_mean']) else ""))
     return rows
 
 
 def print_runtime_table(rows: list[dict]) -> None:
     section("RUNTIME TABLE")
-    say(f"{'run':28s} {'task':26s} {'device':8s} {'seconds':>8s} {'min':>6s} {'ro':>3s} {'ho':>3s} {'fast':>5s} {'nts':>4s} {'peakRSS_MB':>10s}  note")
+    say(f"{'run':28s} {'task':26s} {'device':8s} {'seconds':>8s} {'min':>6s} {'ro':>3s} {'ho':>3s} {'fast':>5s} {'nts':>4s} {'peakRSS_MB':>10s} {'gpu%mean':>8s} {'gpu%max':>7s} {'gpuGB':>6s}  note")
     for r in rows:
         note = r.get("error", "") or ("cpu retry" if r.get("retried_cpu") else "")
         say(f"{r['name']:28s} {r['task']:26s} {str(r['device']):8s} {fmt(r['seconds'], 1):>8s} "
             f"{fmt(r['seconds'] / 60 if r['ok'] and not math.isnan(r['seconds']) else float('nan'), 1):>6s} "
             f"{r['resampling_order']:>3d} {str(r['higher_order_resampling'])[0]:>3s} {str(r['fast'])[0]:>5s} {r.get('nr_thr_saving', 6):>4d} "
-            f"{fmt(r['peak_rss_mb'], 0):>10s}  {note}")
-    say("(peak RSS is the process high-water mark up to that task, not a per-task figure)")
+            f"{fmt(r['peak_rss_mb'], 0):>10s} {fmt(r.get('gpu_util_mean', float('nan')), 0):>8s} "
+            f"{fmt(r.get('gpu_util_max', float('nan')), 0):>7s} {fmt(r.get('gpu_mem_gb', float('nan')), 1):>6s}  {note}")
+    say("(peak RSS is the process high-water mark up to that task, not a per-task figure; gpu% = nvidia-smi utilisation "
+        "sampled every 0.5 s during the task, mean and max; gpuGB = max GPU memory in use)")
 
 
 # ---------------------------------------------------------------------------
