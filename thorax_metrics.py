@@ -159,7 +159,7 @@ class CarinaResult:
 
 def find_carina(lumen: np.ndarray, spacing, *, min_area_mm2: float = 10.0,
                 persist_mm: float = 8.0, min_child_frac: float = 0.10,
-                max_gap_slices: int = 1) -> CarinaResult:
+                max_gap_mm: float = 2.0) -> CarinaResult:
     """Locate the carina from the airway-lumen mask alone.
 
     Rule: take the largest 26-connected lumen component (the tracheobronchial
@@ -169,18 +169,19 @@ def find_carina(lumen: np.ndarray, spacing, *, min_area_mm2: float = 10.0,
     which the trunk is still one component such that, on the slices below,
     it has >= 2 children (each >= `min_child_frac` of the parent area) which
     stay separate and do not re-merge for at least `persist_mm`. Holes in the
-    mask (a missing slice) are bridged up to `max_gap_slices`; an oblique
+    mask (missing slices) are bridged up to `max_gap_mm`; an oblique
     trachea is followed with an adaptive in-plane dilation. Interruptions of
     a bronchus BELOW the carina cannot move the result because the sweep stops
     at the first persistent split.
 
     Failure reasons: "no airway lumen", "no single trunk at top" (the scan
     starts below the carina, or the mask holds two trunks), "trunk lost at
-    z=N" (mask broken for more than max_gap_slices), "no split".
+    z=N" (mask broken for more than max_gap_mm), "no split".
     """
     lumen = np.asarray(lumen).astype(bool, copy=False)
     nz_full = lumen.shape[2]
     empty = np.zeros(nz_full, dtype=int)
+    max_gap_slices = max(1, int(round(max_gap_mm / float(spacing[2]))))
     if not lumen.any():
         return CarinaResult(-1, "no airway lumen", empty, -1, -1)
     # Connected components with vertical gaps of up to max_gap_slices bridged:
@@ -265,6 +266,14 @@ def find_carina(lumen: np.ndarray, spacing, *, min_area_mm2: float = 10.0,
     k_slices = max(2, int(math.ceil(persist_mm / dz)))
 
     def persistent(z_split: int, kids: list[int]) -> bool:
+        """True if at least TWO children of the trunk stay separate for persist_mm.
+
+        Children that die on the way (spurs, islands, a lobar bronchus origin
+        painted as a separate blob) are simply dropped; fronts that re-merge are
+        unioned (a hole in the trunk, not a bifurcation). Requiring every child
+        to survive would miss the carina whenever a third short-lived component
+        sits next to the two main bronchi.
+        """
         fronts: list[tuple[int, set[int]]] = [(z_split, {k}) for k in kids]
         for _ in range(k_slices - 1):
             new_fronts: list[tuple[int, set[int]]] = []
@@ -274,14 +283,20 @@ def find_carina(lumen: np.ndarray, spacing, *, min_area_mm2: float = 10.0,
                     continue
                 z_to, nxt = step_down(zf, comps)
                 if z_to is None:
-                    return False  # this child dies within persist_mm -> spur / noise, not a bronchus
+                    continue  # this child dies within persist_mm -> not a bronchus, ignore it
                 new_fronts.append((z_to, nxt))
-            for i in range(len(new_fronts)):
-                for j in range(i + 1, len(new_fronts)):
-                    if new_fronts[i][0] == new_fronts[j][0] and new_fronts[i][1] & new_fronts[j][1]:
-                        return False  # the fronts re-merge -> it was a hole in the trunk
-            fronts = new_fronts
-        return True
+            merged: list[tuple[int, set[int]]] = []
+            for zf, comps in new_fronts:
+                for i, (zm, cm) in enumerate(merged):
+                    if zm == zf and cm & comps:
+                        merged[i] = (zm, cm | comps)  # re-merged -> same object (hole in the trunk)
+                        break
+                else:
+                    merged.append((zf, comps))
+            fronts = merged
+            if len(fronts) < 2:
+                return False
+        return len(fronts) >= 2
 
     comps_top = sorted(areas[top].items(), key=lambda kv: -kv[1])
     if len(comps_top) > 1 and comps_top[1][1] >= min_child_frac * comps_top[0][1]:

@@ -56,6 +56,17 @@ def test_carina_ignores_short_spur_and_hole_split():
     assert res.found and res.z == 30, res
 
 
+def test_carina_third_child_that_dies_does_not_hide_the_split():
+    """Real case seen on a 0.8 mm CT: right below the carina a third blob (>= 10 %
+    of the trunk area) coexists with the two main bronchi for a few slices and
+    then vanishes. The split must still count."""
+    vol = make_y_tree()
+    for z in (29, 28, 27):
+        vol[:, :, z] |= disk(vol.shape[:2], (30, 36), 2)
+    res = tm.find_carina(vol, SP1)
+    assert res.found and res.z == 30, res
+
+
 def test_carina_not_moved_by_interruption_below():
     vol = make_y_tree()
     vol[:30, :, 20] = False  # one bronchus interrupted below the carina
