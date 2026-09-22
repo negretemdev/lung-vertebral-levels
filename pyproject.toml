@@ -40,3 +40,6 @@ torchvision = [{ index = "pytorch-cu130", marker = "sys_platform == 'win32'" }]
 name = "pytorch-cu130"
 url = "https://download.pytorch.org/whl/cu130"
 explicit = true
+
+[tool.pytest.ini_options]
+markers = ["slow: builds the synthetic case and runs the pipeline end to end"]
