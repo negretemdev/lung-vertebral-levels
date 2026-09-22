@@ -802,6 +802,116 @@ def analyze(ct_path: Path, mask_paths: dict[str, Path]) -> dict:
 
 # ---------------------------------------------------------------------------
 
+
+# ---------------------------------------------------------------------------
+# Variant comparison: what does each setting actually change?
+# ---------------------------------------------------------------------------
+
+VARIANT_GROUPS = {
+    "total": ["total_fast", "total_ro3", "total_ho", "total_no_trachea"],
+    "lung_vessels": ["lung_vessels_ro3", "lung_vessels_ho"],
+}
+
+
+def _total_mask_numbers(data: np.ndarray, spacing) -> dict:
+    """The pipeline's own numbers recomputed from one `total` mask."""
+    lobes, verts = pl.get_label_maps()
+    right = pl._largest_component(np.isin(data, [lobes[n] for n in pl.RIGHT_LOBES]))
+    left = pl._largest_component(np.isin(data, [lobes[n] for n in pl.LEFT_LOBES]))
+    both = right | left
+    vox_ml = tm.voxel_ml(spacing)
+    ext = {"R": pl._z_extremes(right), "L": pl._z_extremes(left), "both": pl._z_extremes(both)}
+    out: dict = {}
+    for side, m in (("R", right), ("L", left), ("both", both)):
+        e = ext[side]
+        out[f"height_{side}_mm"] = round((e[1] - e[0]) * float(spacing[2]), 2) if e else None
+        out[f"vol_{side}_ml"] = round(float(m.sum()) * vox_ml, 2)
+    out.update(levels_from(per_slice_vertebrae(data, {i: n for n, i in verts.items()}), ext))
+    return out
+
+
+def compare_variants(out_dir: Path, ct_path: Path) -> dict:
+    """Compare each saved variant mask against its baseline mask.
+
+    There is no ground truth here, so this does not prove which setting is
+    "right". It answers the practical question: how much does the setting move
+    the masks (Dice, volume) and, more importantly, does it move the numbers
+    the pipeline actually reports?
+    """
+    import nibabel as nib
+    from totalsegmentator.map_to_binary import class_map
+
+    section("VARIANT COMPARISON (saved masks, no inference)")
+    results: dict = {}
+    for base_name, variants in VARIANT_GROUPS.items():
+        base_path = out_dir / f"case_{base_name}.nii.gz"
+        present = [v for v in variants if (out_dir / f"case_{v}.nii.gz").exists()]
+        if not base_path.exists() or not present:
+            say(f"  {base_name}: no variants saved next to it -> nothing to compare"
+                f" (run with --variants / --fast-too first)")
+            continue
+        base_img = nib.as_closest_canonical(nib.load(base_path))
+        base = np.asanyarray(base_img.dataobj).astype(np.uint8)
+        spacing = tuple(float(z) for z in base_img.header.get_zooms()[:3])
+        vox_ml = tm.voxel_ml(spacing)
+        names = dict(class_map[base_name if base_name != "total" else "total"])
+        n_lab = max(names) + 1
+        base_nums = _total_mask_numbers(base, spacing) if base_name == "total" else None
+        if base_name == "lung_vessels":
+            base_car = tm.find_carina(base == 1, spacing)
+
+        for v in present:
+            vimg = nib.as_closest_canonical(nib.load(out_dir / f"case_{v}.nii.gz"))
+            if vimg.shape != base_img.shape or not np.allclose(vimg.affine, base_img.affine, atol=1e-3):
+                say(f"  {v}: different grid from the baseline -> skipped")
+                continue
+            var = np.asanyarray(vimg.dataobj).astype(np.uint8)
+            cb = np.bincount(base.ravel(), minlength=n_lab)
+            cv = np.bincount(var.ravel(), minlength=n_lab)
+            eq = (base == var) & (base > 0)
+            inter = np.bincount(base[eq], minlength=n_lab)
+            del eq
+            say(f"\n  --- {v}  vs  {base_name} ---")
+            say(f"  {'label':26s} {'base ml':>9s} {'var ml':>9s} {'d vol %':>8s} {'Dice':>6s}")
+            rows = sorted((i for i in range(1, n_lab) if cb[i] or cv[i]), key=lambda i: -cb[i])
+            shown = 0
+            dices = []
+            for i in rows:
+                d = 2.0 * inter[i] / (cb[i] + cv[i]) if (cb[i] + cv[i]) else float("nan")
+                dices.append(d)
+                if shown < 12:
+                    dv = 100.0 * (cv[i] - cb[i]) / cb[i] if cb[i] else float("nan")
+                    say(f"  {names.get(i, str(i)):26s} {cb[i] * vox_ml:9.2f} {cv[i] * vox_ml:9.2f}"
+                        f" {fmt(dv, 1):>8s} {fmt(d, 4):>6s}")
+                    shown += 1
+            if len(rows) > shown:
+                say(f"  ... {len(rows) - shown} further labels")
+            mean_d = float(np.nanmean(dices)) if dices else float("nan")
+            say(f"  mean Dice over {len(rows)} labels: {fmt(mean_d, 4)}"
+                f" | voxels differing: {int((cb.sum() - cb[0]) + (cv.sum() - cv[0]) - 2 * inter.sum())}")
+            results[f"{v}_mean_dice"] = round(mean_d, 4)
+
+            if base_name == "total":
+                vn = _total_mask_numbers(var, spacing)
+                say(f"  {'pipeline number':20s} {'baseline':>10s} {'variant':>10s} {'difference':>12s}")
+                for k in base_nums:
+                    a, b = base_nums[k], vn[k]
+                    if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+                        diff = f"{b - a:+.2f}"
+                    else:
+                        diff = "same" if a == b else "CHANGED"
+                    say(f"  {k:20s} {str(a):>10s} {str(b):>10s} {diff:>12s}")
+                results[f"{v}_numbers"] = vn
+            if base_name == "lung_vessels":
+                vc = tm.find_carina(var == 1, spacing)
+                dz = (vc.z - base_car.z) * spacing[2] if (vc.found and base_car.found) else float("nan")
+                say(f"  carina: baseline z={base_car.z} variant z={vc.z} ({fmt(dz, 1)} mm)")
+                results[f"{v}_carina_dz_mm"] = dz
+            del var
+        del base
+    return results
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     src = ap.add_mutually_exclusive_group()
@@ -815,6 +925,8 @@ def main() -> int:
     ap.add_argument("--fast-too", action="store_true", help="also time the 3 mm fast total model")
     ap.add_argument("--variants", action="store_true", help="also time resampling variants")
     ap.add_argument("--skip-inference", action="store_true", help="analyse existing masks in --out only")
+    ap.add_argument("--compare", action="store_true",
+                    help="compare the saved variant masks (fast / resampling_order 3 / higher_order_resampling / no-trachea) against their baseline: per-label Dice, volume change, and whether the pipeline numbers move. Implies --skip-inference.")
     ap.add_argument("--no-download", action="store_true", help="skip the untimed weight pre-download")
     ap.add_argument("--nr-thr-saving", type=int, default=6,
                     help="TotalSegmentator nr_thr_saving = nnU-Net export worker processes per model call "
@@ -823,6 +935,8 @@ def main() -> int:
     ap.add_argument("--json", type=Path, default=None, help="write the identifier-free summary here")
     args = ap.parse_args()
     args.tasks = [t.strip() for t in args.tasks.split(",") if t.strip()]
+    if args.compare:
+        args.skip_inference = True
     bad = [t for t in args.tasks if t not in ALL_TASKS]
     if bad:
         sys.exit(f"error: unknown task(s) {bad}; choose from {ALL_TASKS}")
@@ -850,6 +964,8 @@ def main() -> int:
 
     mask_paths = {name: args.out / f"case_{name}.nii.gz" for name, _ in runs if name in ALL_TASKS}
     summary = safe(analyze, "analysis", ct_path, mask_paths) or {}
+    if args.compare:
+        summary.update(safe(compare_variants, "variant comparison", args.out, ct_path) or {})
     print_runtime_table(rows)
 
     say(f"\ntotal wall time: {(time.monotonic() - t_all) / 60:.1f} min")
