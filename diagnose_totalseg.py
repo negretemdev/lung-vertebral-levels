@@ -379,12 +379,17 @@ def prepare_ct(args, out: Path) -> tuple[Path, dict]:
 
 
 def build_runs(args, roi: list[str], roi_no_trachea: list[str], cuda: bool) -> list[tuple[str, dict]]:
+    common: dict = {}
+    if args.resampling_order != 1:
+        common["resampling_order"] = args.resampling_order
+    if args.higher_order_resampling:
+        common["higher_order_resampling"] = True
     base = {
-        "total": dict(task="total", roi_subset=roi),
-        "vertebrae_pp_refined": dict(task="vertebrae_pp_refined"),
-        "trunk_cavities": dict(task="trunk_cavities"),
-        "lung_vessels": dict(task="lung_vessels"),
-        "pleural_pericard_effusion": dict(task="pleural_pericard_effusion"),
+        "total": dict(task="total", roi_subset=roi, **common),
+        "vertebrae_pp_refined": dict(task="vertebrae_pp_refined", **common),
+        "trunk_cavities": dict(task="trunk_cavities", **common),
+        "lung_vessels": dict(task="lung_vessels", **common),
+        "pleural_pericard_effusion": dict(task="pleural_pericard_effusion", **common),
     }
     runs = [(t, base[t]) for t in ALL_TASKS if t in args.tasks]
     if args.fast_too:
@@ -428,7 +433,7 @@ def download_weights(runs: list[tuple[str, dict]]) -> None:
 
 
 def run_tasks(runs: list[tuple[str, dict]], ct_path: Path, out: Path, device: str, skip: bool,
-              nr_thr_saving: int = 6, nr_thr_resamp: int = 1) -> list[dict]:
+              nr_thr_saving: int = 6, nr_thr_resamp: int = 1, suffix: str = "") -> list[dict]:
     section("RUNTIME PER TASK" + (" (skip-inference: reading existing masks)" if skip else ""))
     from totalsegmentator.python_api import totalsegmentator
     say(f"  settings: nr_thr_saving={nr_thr_saving} (nnU-Net export worker processes per model call) | "
@@ -436,8 +441,9 @@ def run_tasks(runs: list[tuple[str, dict]], ct_path: Path, out: Path, device: st
 
     rows: list[dict] = []
     for name, kw in runs:
-        mask = out / f"case_{name}.nii.gz"
-        report = out / f"case_{name}.report.json"
+        tag = f"{name}{suffix}" if name in ALL_TASKS else name
+        mask = out / f"case_{tag}.nii.gz"
+        report = out / f"case_{tag}.report.json"
         row = dict(name=name, task=kw["task"], device=device, seconds=float("nan"), ok=False,
                    retried_cpu=False, peak_rss_mb=float("nan"), error="", fast=bool(kw.get("fast", False)),
                    resampling_order=kw.get("resampling_order", 1),
@@ -807,12 +813,6 @@ def analyze(ct_path: Path, mask_paths: dict[str, Path]) -> dict:
 # Variant comparison: what does each setting actually change?
 # ---------------------------------------------------------------------------
 
-VARIANT_GROUPS = {
-    "total": ["total_fast", "total_ro3", "total_ho", "total_no_trachea"],
-    "lung_vessels": ["lung_vessels_ro3", "lung_vessels_ho"],
-}
-
-
 def _total_mask_numbers(data: np.ndarray, spacing) -> dict:
     """The pipeline's own numbers recomputed from one `total` mask."""
     lobes, verts = pl.get_label_maps()
@@ -843,18 +843,19 @@ def compare_variants(out_dir: Path, ct_path: Path) -> dict:
 
     section("VARIANT COMPARISON (saved masks, no inference)")
     results: dict = {}
-    for base_name, variants in VARIANT_GROUPS.items():
+    found_any = False
+    for base_name in ALL_TASKS:
         base_path = out_dir / f"case_{base_name}.nii.gz"
-        present = [v for v in variants if (out_dir / f"case_{v}.nii.gz").exists()]
+        present = sorted(p.name[len("case_"):-len(".nii.gz")]
+                         for p in out_dir.glob(f"case_{base_name}_*.nii.gz"))
         if not base_path.exists() or not present:
-            say(f"  {base_name}: no variants saved next to it -> nothing to compare"
-                f" (run with --variants / --fast-too first)")
             continue
+        found_any = True
         base_img = nib.as_closest_canonical(nib.load(base_path))
         base = np.asanyarray(base_img.dataobj).astype(np.uint8)
         spacing = tuple(float(z) for z in base_img.header.get_zooms()[:3])
         vox_ml = tm.voxel_ml(spacing)
-        names = dict(class_map[base_name if base_name != "total" else "total"])
+        names = dict(class_map[base_name])
         n_lab = max(names) + 1
         base_nums = _total_mask_numbers(base, spacing) if base_name == "total" else None
         if base_name == "lung_vessels":
@@ -909,6 +910,9 @@ def compare_variants(out_dir: Path, ct_path: Path) -> dict:
                 results[f"{v}_carina_dz_mm"] = dz
             del var
         del base
+    if not found_any:
+        say("  no variant masks found next to the baselines. Produce some with --variants / --fast-too,")
+        say("  or with --resampling-order / --higher-order-resampling together with --label <name>.")
     return results
 
 
@@ -932,6 +936,16 @@ def main() -> int:
                     help="TotalSegmentator nr_thr_saving = nnU-Net export worker processes per model call "
                          "(TotalSegmentator default 6; 1 avoids starting 6 python processes per model call)")
     ap.add_argument("--nr-thr-resamp", type=int, default=1, help="TotalSegmentator nr_thr_resamp (default 1)")
+    ap.add_argument("--resampling-order", type=int, default=1,
+                    help="spline order used to resample the CT into the model grid (1 = linear, TotalSegmentator "
+                         "default; 3 = cubic, slightly better and a little slower). Applies to all five tasks.")
+    ap.add_argument("--higher-order-resampling", action="store_true",
+                    help="let nnU-Net resample its probability maps onto the CT grid and decide there, instead of "
+                         "deciding on the model grid and snapping labels back. nnU-Net's native export path. "
+                         "Applies to all five tasks.")
+    ap.add_argument("--label", default="",
+                    help="suffix for this run's mask files (e.g. --label ho3 writes case_total_ho3.nii.gz), so a "
+                         "settings run does not overwrite the baseline masks and --compare can measure the difference")
     ap.add_argument("--json", type=Path, default=None, help="write the identifier-free summary here")
     args = ap.parse_args()
     args.tasks = [t.strip() for t in args.tasks.split(",") if t.strip()]
@@ -959,10 +973,11 @@ def main() -> int:
     runs = build_runs(args, roi, roi_no_trachea, cuda=bool(env.get("cuda")))
     if not args.skip_inference and not args.no_download:
         download_weights(runs)
+    suffix = f"_{args.label}" if args.label else ""
     rows = run_tasks(runs, ct_path, args.out, device, args.skip_inference,
-                     nr_thr_saving=args.nr_thr_saving, nr_thr_resamp=args.nr_thr_resamp)
+                     nr_thr_saving=args.nr_thr_saving, nr_thr_resamp=args.nr_thr_resamp, suffix=suffix)
 
-    mask_paths = {name: args.out / f"case_{name}.nii.gz" for name, _ in runs if name in ALL_TASKS}
+    mask_paths = {name: args.out / f"case_{name}{suffix}.nii.gz" for name, _ in runs if name in ALL_TASKS}
     summary = safe(analyze, "analysis", ct_path, mask_paths) or {}
     if args.compare:
         summary.update(safe(compare_variants, "variant comparison", args.out, ct_path) or {})
