@@ -391,6 +391,14 @@ def select_series(source: Path | dict[str, Series], min_slices: int) -> Series:
     if not axial:
         log.warning("  no axial CT series among candidates; falling back to largest series")
     chosen = max(pool, key=lambda s: s.n_slices)
+    if chosen.first_ds is None and chosen.files:
+        # A case restored from the flat index carries no header yet: read the one
+        # file we actually need, rather than all of them during the scan.
+        try:
+            chosen.first_ds = pydicom.dcmread(chosen.files[0], stop_before_pixels=True)
+        except Exception as e:
+            log.warning("  could not read the header of %s (%s); the identity and acquisition "
+                        "columns may stay empty", chosen.files[0].name, e)
     log.info(
         "  series: '%s' (%s, %d slices in %d files, %d series in folder, uid ...%s)",
         chosen.description or "<no description>", chosen.modality or "?",
@@ -431,6 +439,75 @@ def read_identity(s: Series, folder_id: str) -> dict:
         "study_date": date,
         "id_mismatch": folder_id.strip() != pid,  # missing PatientID also counts as mismatch
     }
+
+
+FLAT_INDEX_VERSION = 1
+
+
+def flat_index_path(output: Path) -> Path:
+    return output / "flat_index.json"
+
+
+def save_flat_index(path: Path, input_root: Path, cases: list[tuple[str, dict[str, Series]]]) -> None:
+    """Remember which files belong to which case.
+
+    Grouping a flat export means opening the header of every file, which on an
+    external drive is minutes of random reads. The result only changes when the
+    data does, so it is written once and reused.
+    """
+    payload = {
+        "version": FLAT_INDEX_VERSION,
+        "input_root": str(input_root.resolve()),
+        "scanned_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "cases": [
+            {"case_id": cid,
+             "series": [{"uid": s.uid, "files": [str(f) for f in s.files], "n_slices": s.n_slices,
+                         "modality": s.modality, "description": s.description,
+                         "is_axial": s.is_axial, "patient_id": s.patient_id,
+                         "study_uid": s.study_uid, "study_date": s.study_date}
+                        for s in pool.values()]}
+            for cid, pool in cases
+        ],
+    }
+    tmp = path.with_name("_partial_" + path.name)
+    tmp.write_text(json.dumps(payload))
+    _replace_retry(tmp, path)
+
+
+def load_flat_index(path: Path, input_root: Path) -> list[tuple[str, dict[str, Series]]] | None:
+    """The saved grouping, or None if there is none that still fits this input."""
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text())
+    except Exception as e:
+        log.warning("flat index unreadable (%s) -> rescanning", e)
+        return None
+    if data.get("version") != FLAT_INDEX_VERSION:
+        log.info("flat index was written by an older version -> rescanning")
+        return None
+    if data.get("input_root") != str(input_root.resolve()):
+        log.info("flat index was built for a different input folder -> rescanning")
+        return None
+    cases: list[tuple[str, dict[str, Series]]] = []
+    for c in data.get("cases", []):
+        pool = {sd["uid"]: Series(uid=sd["uid"], files=[Path(f) for f in sd["files"]],
+                                  n_slices=sd["n_slices"], modality=sd["modality"],
+                                  description=sd["description"], is_axial=sd["is_axial"],
+                                  patient_id=sd["patient_id"], study_uid=sd["study_uid"],
+                                  study_date=sd["study_date"])
+                for sd in c["series"]}
+        cases.append((c["case_id"], pool))
+    if not cases:
+        return None
+    # Cheap sanity check: if the data moved, one spot check catches it.
+    probe = next(iter(cases[0][1].values()))
+    if probe.files and not probe.files[0].exists():
+        log.warning("flat index points at files that are no longer there -> rescanning")
+        return None
+    log.info("flat index reused: %d cases, scanned %s (use --rescan after adding data)",
+             len(cases), data.get("scanned_utc", "?"))
+    return cases
 
 
 def find_dicomdirs(root: Path, max_depth: int = 3) -> list[Path]:
@@ -1484,10 +1561,14 @@ def main() -> int:
                     help="Process `total` in 3 chunks to save memory (do not use on small images)")
     ap.add_argument("--test", action="store_true", help="Process only the first 2 patients")
     ap.add_argument("--dry-run", action="store_true",
-                    help="Only list patients and check DICOM series selection; no segmentation, no CSV")
+                    help="Only list patients and check DICOM series selection; no segmentation, "
+                         "no CSV (with --flat it does save the file index, so the real run is fast)")
     ap.add_argument("--flat", action="store_true",
                     help="Input is a single DICOM export (e.g. DICOMDIR + IMAGES folder) with no "
                          "per-patient subfolders: cases are detected by the PatientID inside the files")
+    ap.add_argument("--rescan", action="store_true",
+                    help="With --flat: rebuild the saved index of which files belong to which "
+                         "patient. Needed only after adding or moving data")
     ap.add_argument("--recheck-geometry", action="store_true",
                     help="Recovery pass: re-convert every saved CT with the fixed converter and "
                          "re-segment ONLY the cases whose geometry actually changed")
@@ -1560,7 +1641,16 @@ def main() -> int:
     # Build the case list. A case is (case_id, source) where source is either a
     # patient folder (default mode) or a pre-scanned series pool (--flat).
     if args.flat:
-        cases: list[tuple[str, Path | dict[str, Series]]] = build_flat_cases(args.input_root)
+        index = None if args.rescan else load_flat_index(flat_index_path(args.output), args.input_root)
+        if index is None:
+            cases = build_flat_cases(args.input_root)
+            try:
+                save_flat_index(flat_index_path(args.output), args.input_root, cases)
+                log.info("flat index saved: the next run over this folder skips the scan")
+            except OSError as e:
+                log.warning("could not save the flat index (%s); the next run will scan again", e)
+        else:
+            cases = index
         kind = "patients (by PatientID + study)"
     else:
         cases = [(p.name, p) for p in sorted(args.input_root.iterdir())

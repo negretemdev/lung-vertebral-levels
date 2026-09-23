@@ -264,6 +264,70 @@ def test_flat_pools_skip_the_multi_patient_check():
 
 
 # ---------------------------------------------------------------------------
+# The flat index: scan once, reuse afterwards
+# ---------------------------------------------------------------------------
+
+def _pool(tmp_path, pid, n=3):
+    files = []
+    for i in range(n):
+        f = tmp_path / f"{pid}_{i}.dcm"
+        f.write_bytes(b"not really dicom, only its path is indexed")
+        files.append(f)
+    return {f"uid-{pid}": pl.Series(uid=f"uid-{pid}", files=files, n_slices=n, modality="CT",
+                                    description="Chest", is_axial=True, patient_id=pid,
+                                    study_uid=f"study-{pid}", study_date="20260830")}
+
+
+def test_flat_index_round_trip(tmp_path):
+    cases = [("MRN-1", _pool(tmp_path, "MRN-1")), ("MRN-2", _pool(tmp_path, "MRN-2", n=5))]
+    idx = pl.flat_index_path(tmp_path)
+    pl.save_flat_index(idx, tmp_path, cases)
+
+    back = pl.load_flat_index(idx, tmp_path)
+    assert [c for c, _ in back] == ["MRN-1", "MRN-2"]
+    s2 = next(iter(back[1][1].values()))
+    assert s2.n_slices == 5 and s2.patient_id == "MRN-2" and s2.is_axial is True
+    assert [f.name for f in s2.files] == [f"MRN-2_{i}.dcm" for i in range(5)]
+    # the header is not stored: it is read later, for the one series that is used
+    assert s2.first_ds is None
+
+
+def test_flat_index_is_rejected_when_it_no_longer_fits(tmp_path):
+    cases = [("MRN-1", _pool(tmp_path, "MRN-1"))]
+    idx = pl.flat_index_path(tmp_path)
+    pl.save_flat_index(idx, tmp_path, cases)
+
+    other = tmp_path / "elsewhere"
+    other.mkdir()
+    assert pl.load_flat_index(idx, other) is None           # built for another input folder
+
+    data = json.loads(idx.read_text())
+    data["version"] = pl.FLAT_INDEX_VERSION + 1
+    idx.write_text(json.dumps(data))
+    assert pl.load_flat_index(idx, tmp_path) is None        # written by another version
+
+    pl.save_flat_index(idx, tmp_path, cases)
+    for f in tmp_path.glob("MRN-1_*.dcm"):
+        f.unlink()
+    assert pl.load_flat_index(idx, tmp_path) is None        # the data moved away
+
+    assert pl.load_flat_index(tmp_path / "absent.json", tmp_path) is None
+
+
+def test_missing_header_is_read_when_the_series_is_chosen(tmp_path):
+    """A case restored from the index carries no header until it is actually used."""
+    import make_fake_case as mk
+    mk.write_series(tmp_path, None, n_slices=2, axial=True, study_uid="1.2.3",
+                    series_desc="Chest", series_num=1)
+    files = sorted(tmp_path.glob("*.dcm"))
+    pool = {"uid": pl.Series(uid="uid", files=files, n_slices=len(files), modality="CT",
+                             is_axial=True, patient_id="FAKE-123")}
+    chosen = pl.select_series(pool, min_slices=1)
+    assert chosen.first_ds is not None
+    assert pl.read_identity(chosen, "FAKE-123")["dicom_patient_id"] == "FAKE-123"
+
+
+# ---------------------------------------------------------------------------
 # End to end on the synthetic case
 # ---------------------------------------------------------------------------
 

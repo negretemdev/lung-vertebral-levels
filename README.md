@@ -132,6 +132,14 @@ row naming the count, rather than a quietly wrong result.
 Run `--flat --dry-run` first to see the detected patient list before segmenting
 anything.
 
+**The scan happens once.** Grouping an export means opening the header of every
+file, which on an external drive is minutes of small random reads, not seconds
+of parsing. The result is saved as `flat_index.json` in the output folder and
+reused by every later run over the same input, including the real run after a
+dry run. Pass `--rescan` after adding or moving data; the index is also dropped
+automatically if it was built for a different input folder, written by an older
+version, or points at files that are no longer there.
+
 - **Input root** (layout 1) = the folder that directly contains one subfolder
   per patient (not a single patient's folder). Every immediate subfolder is
   treated as a patient.
@@ -263,6 +271,7 @@ Other flags:
 | `--total-vertebrae` | also ask `total` for the vertebrae. Off by default: the levels come from the vertebral bodies, and asking `total` for vertebrae runs a second model for labels nothing reads. Turning it on restores the independent cross-check of the levels |
 | `--force-split` | process `total` in 3 chunks to use less memory |
 | `--nr-thr-saving N` | nnU-Net export worker processes per model call (default 1) |
+| `--rescan` | with `--flat`, rebuild the saved file index. Needed only after adding or moving data |
 | `--min-slices N` | ignore series with fewer slices (default 20) |
 
 ## Measurement guide — every column of results.csv
