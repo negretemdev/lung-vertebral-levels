@@ -294,6 +294,19 @@ def mask_files(masks_dir: Path, task: str, fast: bool) -> tuple[Path, Path]:
     return masks_dir / f"{stem}.nii.gz", masks_dir / f"{stem}.report.json"
 
 
+def report_matches(rep: dict, task: str, was_fast: bool, roi_subset: list[str] | None) -> bool:
+    """Whether a run report describes the mask this run would produce.
+
+    A mask carrying MORE classes than we asked for still counts; one missing any
+    of them does not. That is what lets --total-vertebrae be switched off without
+    invalidating masks that have the vertebrae, and switched on without wrongly
+    accepting masks that lack them.
+    """
+    if rep.get("task") != task or bool(rep.get("fast")) != was_fast:
+        return False
+    return set(roi_subset or []).issubset(set(rep.get("roi_subset") or []))
+
+
 def check_reusable(mask_path: Path, report_path: Path, ct_path: Path, task: str,
                    was_fast: bool, roi_subset: list[str] | None) -> tuple[bool, list[str]]:
     """Whether a saved mask may be reused, plus any warnings about it.
@@ -310,12 +323,7 @@ def check_reusable(mask_path: Path, report_path: Path, ct_path: Path, task: str,
     except Exception as e:
         log.warning("  unreadable run report %s (%s) -> re-segmenting", report_path.name, e)
         return False, []
-    if rep.get("task") != task or bool(rep.get("fast")) != was_fast:
-        return False, []
-    # A mask that carries MORE classes than we asked for is still usable; one
-    # that is missing any of them is not. This is what lets --total-vertebrae be
-    # switched off without invalidating masks that already have them.
-    if not set(roi_subset or []).issubset(set(rep.get("roi_subset") or [])):
+    if not report_matches(rep, task, was_fast, roi_subset):
         return False, []
     try:
         verify_same_grid(mask_path, ct_path)
@@ -1523,16 +1531,31 @@ def measure_case(ct_path: Path | None, mask_paths: dict[str, Path],
 # Batch driver
 # ---------------------------------------------------------------------------
 
-def masks_present(output: Path, case_id: str, tasks: list[TaskSpec], fast: bool) -> int:
-    """How many of this run's tasks already have a mask and a report on disk."""
+def masks_present(output: Path, case_id: str, tasks: list[TaskSpec], fast: bool,
+                  roi_subset: list[str] | None = None) -> int:
+    """How many of this run's tasks already have a usable mask.
+
+    This asks the same question as the reuse rule, minus the grid check, so a run
+    that changes what it wants from a task -- another class list, another
+    resolution -- reopens the case instead of skipping it on a filename.
+    """
     md = masks_dir_for(output, case_id)
     have = 0
     for spec in tasks:
-        stems = [spec.name]
+        wanted = roi_subset if spec.uses_roi_subset else None
+        candidates = [(spec.name, False)]
         if fast and supports_fast(spec.name):
-            stems.append(f"{spec.name}_fast")
-        if any((md / f"{st}.nii.gz").exists() and (md / f"{st}.report.json").exists() for st in stems):
-            have += 1
+            candidates.append((f"{spec.name}_fast", True))
+        for stem, was_fast in candidates:
+            if not (md / f"{stem}.nii.gz").exists():
+                continue
+            try:
+                rep = json.loads((md / f"{stem}.report.json").read_text())
+            except Exception:
+                continue
+            if report_matches(rep, spec.name, was_fast, wanted):
+                have += 1
+                break
     return have
 
 
@@ -1875,8 +1898,10 @@ def main() -> int:
     if not (args.remeasure or args.dry_run):
         done = measured_cases(csv_path)
         if done:
+            roi = total_roi_subset(total_vertebrae)
             keep = [(cid, src) for cid, src in cases
-                    if not (cid in done and masks_present(args.output, cid, tasks, args.fast) == len(tasks))]
+                    if not (cid in done
+                            and masks_present(args.output, cid, tasks, args.fast, roi) == len(tasks))]
             if len(keep) != len(cases):
                 log.info("=== %d case(s) already finished in results.csv: skipping "
                          "(--remeasure to redo them) ===", len(cases) - len(keep), extra=SHOW)
@@ -1895,7 +1920,8 @@ def main() -> int:
     detail = show_if(args.verbose or args.dry_run)
     log.info("=== %d %s found ===", len(cases), kind, extra=detail)
     for i, (case_id, _src) in enumerate(cases, start=1):
-        have = masks_present(args.output, case_id, tasks, args.fast)
+        have = masks_present(args.output, case_id, tasks, args.fast,
+                             total_roi_subset(total_vertebrae))
         n_ready += have == len(tasks)
         log.info("  %3d/%d  %-40s %d/%d masks present", i, len(cases), case_id, have, len(tasks),
                  extra=detail)

@@ -290,16 +290,33 @@ def test_measured_cases_reads_back_the_good_rows(tmp_path):
 
 def test_masks_present_counts_only_complete_pairs(tmp_path):
     tasks = pl.parse_tasks("total,trunk_cavities")
+    roi = pl.total_roi_subset(False)
     md = pl.masks_dir_for(tmp_path, "A")
     md.mkdir(parents=True)
-    assert pl.masks_present(tmp_path, "A", tasks, fast=False) == 0
+    assert pl.masks_present(tmp_path, "A", tasks, False, roi) == 0
     _nifti(md / "total.nii.gz")
-    assert pl.masks_present(tmp_path, "A", tasks, fast=False) == 0   # report missing
-    _report(md / "total.report.json", "total")
-    assert pl.masks_present(tmp_path, "A", tasks, fast=False) == 1
+    assert pl.masks_present(tmp_path, "A", tasks, False, roi) == 0   # report missing
+    _report(md / "total.report.json", "total", roi=roi)
+    assert pl.masks_present(tmp_path, "A", tasks, False, roi) == 1
     _nifti(md / "trunk_cavities.nii.gz")
     _report(md / "trunk_cavities.report.json", "trunk_cavities")
-    assert pl.masks_present(tmp_path, "A", tasks, fast=False) == 2
+    assert pl.masks_present(tmp_path, "A", tasks, False, roi) == 2
+
+
+def test_asking_for_the_vertebrae_reopens_a_finished_case(tmp_path):
+    """The exact trap: a case finished without the vertebrae in `total` must not
+    be skipped when a later run asks for them, or --total-vertebrae would be a
+    no-op on the cases that need it most."""
+    tasks = pl.parse_tasks("total")
+    md = pl.masks_dir_for(tmp_path, "A")
+    md.mkdir(parents=True)
+    _nifti(md / "total.nii.gz")
+    _report(md / "total.report.json", "total", roi=pl.total_roi_subset(False))
+
+    without = pl.total_roi_subset(False)
+    with_v = pl.total_roi_subset(True)
+    assert pl.masks_present(tmp_path, "A", tasks, False, without) == 1   # finished
+    assert pl.masks_present(tmp_path, "A", tasks, False, with_v) == 0    # reopened
 
 
 def test_a_finished_case_is_skipped_but_a_new_task_reopens_it(tmp_path):
@@ -309,14 +326,15 @@ def test_a_finished_case_is_skipped_but_a_new_task_reopens_it(tmp_path):
     md = pl.masks_dir_for(tmp_path, "A")
     md.mkdir(parents=True)
     _nifti(md / "total.nii.gz")
-    _report(md / "total.report.json", "total")
+    _report(md / "total.report.json", "total", roi=pl.total_roi_subset(False))
 
     done = pl.measured_cases(tmp_path / "results.csv")
     only_total = pl.parse_tasks("total")
-    assert "A" in done and pl.masks_present(tmp_path, "A", only_total, False) == len(only_total)
+    roi = pl.total_roi_subset(False)
+    assert "A" in done and pl.masks_present(tmp_path, "A", only_total, False, roi) == len(only_total)
 
     with_more = pl.parse_tasks("total,lung_vessels")
-    assert pl.masks_present(tmp_path, "A", with_more, False) < len(with_more)
+    assert pl.masks_present(tmp_path, "A", with_more, False, roi) < len(with_more)
 
 
 # ---------------------------------------------------------------------------
