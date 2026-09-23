@@ -505,8 +505,8 @@ def load_flat_index(path: Path, input_root: Path) -> list[tuple[str, dict[str, S
     if probe.files and not probe.files[0].exists():
         log.warning("flat index points at files that are no longer there -> rescanning")
         return None
-    log.info("flat index reused: %d cases, scanned %s (use --rescan after adding data)",
-             len(cases), data.get("scanned_utc", "?"))
+    log.info("flat index reused: %d cases from %s, scanned %s (--rescan after adding data)",
+             len(cases), path, data.get("scanned_utc", "?"))
     return cases
 
 
@@ -1646,7 +1646,8 @@ def main() -> int:
             cases = build_flat_cases(args.input_root)
             try:
                 save_flat_index(flat_index_path(args.output), args.input_root, cases)
-                log.info("flat index saved: the next run over this folder skips the scan")
+                log.info("flat index saved to %s (%d cases): every later run with this "
+                         "--output skips the scan", flat_index_path(args.output), len(cases))
             except OSError as e:
                 log.warning("could not save the flat index (%s); the next run will scan again", e)
         else:
