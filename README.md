@@ -171,10 +171,38 @@ uv run python pipeline.py --input /Volumes/MyDrive/exports --output ./out --flat
 uv run python pipeline.py --input /Volumes/MyDrive/exports --output ./out --flat
 ```
 
-**Every run** (with or without `--dry-run`) starts by instantly printing the
-full patient roster — every folder found, numbered, with whether it will be
-segmented or only re-measured (resume) — so you can confirm the count before
-any heavy work starts:
+### What you see while it runs
+
+The console stays quiet: a header, one live progress line, and one line per
+finished case.
+
+```
+INPUT  (read-only): D:\cohort
+OUTPUT            : D:\lung_measurements
+resolution        : full (1.5 mm) -> D:\lung_measurements\full
+device            : gpu (auto)
+tasks             : total, vertebrae_pp_refined, lung_vessels, pleural_pericard_effusion, trunk_cavities
+=== 99 patients (by PatientID + study): 2 already complete, 97 to segment ===
+[  1/99] 12345678  ok  (6:52)
+[  2/99] 12345679  ok; uneven slice spacing: median 0.80 mm, worst gap off by 0.31 mm  (3:58)
+ 12%|##                | 12/99 [48:21<5:50:12] 12345690      lung_vessels
+```
+
+The live line names the patient and the task running right now, so a long batch
+never looks stuck. Everything else — the chosen series, each mask reused or
+segmented, and whatever TotalSegmentator, torch and ITK print — goes to
+`pipeline.log`, which always keeps the full detail. `--verbose` puts all of it
+on screen too, for when something needs debugging.
+
+Redirecting to a file (`> run.log`) switches the progress bar off, since a bar
+in a file is thousands of redraw lines; each case then announces its start as
+well as its result.
+
+**Every run** (with or without `--dry-run`) begins by listing the full patient
+roster in `pipeline.log` — every case found, numbered, with how many of its
+masks already exist — and prints the count to the console, so you can confirm
+it before any heavy work starts. `--verbose` and `--dry-run` put the whole
+roster on screen:
 
 ```
 INPUT  (read-only): /Volumes/MyDrive/chest_cts
@@ -271,6 +299,7 @@ Other flags:
 | `--total-vertebrae` | also ask `total` for the vertebrae. Off by default: the levels come from the vertebral bodies, and asking `total` for vertebrae runs a second model for labels nothing reads. Turning it on restores the independent cross-check of the levels |
 | `--force-split` | process `total` in 3 chunks to use less memory |
 | `--nr-thr-saving N` | nnU-Net export worker processes per model call (default 1) |
+| `-v`, `--verbose` | put everything on the console, including what TotalSegmentator, torch and ITK print. `pipeline.log` has it either way |
 | `--rescan` | with `--flat`, rebuild the saved file index. Needed only after adding or moving data |
 | `--min-slices N` | ignore series with fewer slices (default 20) |
 

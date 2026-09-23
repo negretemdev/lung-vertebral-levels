@@ -27,8 +27,10 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import csv
 import gc
+import io
 import json
 import logging
 import os
@@ -48,6 +50,42 @@ from scipy import ndimage
 from tqdm import tqdm
 
 log = logging.getLogger("pipeline")
+
+# Mark a log record for the console. Without it a record still goes to the log
+# file, which always keeps everything. --verbose puts everything on screen.
+SHOW = {"console": True}
+VERBOSE = False
+
+
+def show_if(cond: bool) -> dict:
+    return SHOW if cond else {}
+
+
+@contextlib.contextmanager
+def captured_output(label: str):
+    """Send whatever a library prints to the log file instead of the console.
+
+    TotalSegmentator announces each step with plain print(), and torch and
+    nnU-Net add their own warnings. On a batch run that buries the one line that
+    matters and says nothing the log file cannot hold.
+    """
+    if VERBOSE:
+        yield
+        return
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+            yield
+    finally:
+        for line in buf.getvalue().splitlines():
+            if line.strip():
+                log.debug("    [%s] %s", label, line.rstrip())
+
+
+def fmt_duration(seconds: float) -> str:
+    m, sec = divmod(int(round(seconds)), 60)
+    h, m = divmod(m, 60)
+    return f"{h}:{m:02d}:{sec:02d}" if h else f"{m}:{sec:02d}"
 
 CSV_COLUMNS = [
     "folder_id", "dicom_patient_id", "accession_number", "study_date", "id_mismatch",
@@ -550,7 +588,7 @@ def load_flat_index(path: Path, input_root: Path) -> list[tuple[str, dict[str, S
         log.warning("flat index points at files that are no longer there -> rescanning")
         return None
     log.info("flat index reused: %d cases from %s, scanned %s (--rescan after adding data)",
-             len(cases), path, data.get("scanned_utc", "?"))
+             len(cases), path, data.get("scanned_utc", "?"), extra=SHOW)
     return cases
 
 
@@ -669,6 +707,11 @@ def convert_series_to_nifti(files_sorted: list[Path], out_path: Path) -> None:
     with the geometry recomputed from the slice positions (see _fix_geometry)."""
     import SimpleITK as sitk
 
+    if not VERBOSE:
+        # ITK warns on the console about non-uniform sampling. slice_spacing_notes
+        # measures the same thing in millimetres and puts it in the CSV, where a
+        # batch run can actually act on it.
+        sitk.ProcessObject_GlobalWarningDisplayOff()
     out_path.parent.mkdir(parents=True, exist_ok=True)
     tmp = out_path.with_name("_partial_" + out_path.name)
     try:
@@ -803,7 +846,7 @@ def resolve_device(arg: str) -> str:
     mps = torch.backends.mps.is_available()
     if arg == "auto":
         chosen = "gpu" if cuda else ("mps" if mps else "cpu")
-        log.info("device: auto -> %s (CUDA %s, MPS %s)", chosen, cuda, mps)
+        log.debug("device auto -> %s (CUDA available %s, MPS available %s)", chosen, cuda, mps)
         return chosen
     if arg.startswith("gpu") and not cuda:
         raise SystemExit("error: --device gpu was requested but CUDA is not available")
@@ -893,14 +936,15 @@ def run_task(ct_input: Path, spec: TaskSpec, mask_path: Path, report_path: Path,
             tmp_mask.unlink(missing_ok=True)
             tmp_report.unlink(missing_ok=True)
             try:
-                totalsegmentator(
-                    input=ct_input, output=tmp_mask, task=spec.name, ml=True, quiet=True,
-                    fast=eff_fast, roi_subset=roi_subset if spec.uses_roi_subset else None,
-                    device=dev, robust_crop=ROBUST_CROP, report=str(tmp_report),
-                    resampling_order=RESAMPLING_ORDER,
-                    higher_order_resampling=spec.higher_order,
-                    nr_thr_saving=nr_thr_saving, force_split=split,
-                )
+                with captured_output(spec.name):
+                    totalsegmentator(
+                        input=ct_input, output=tmp_mask, task=spec.name, ml=True, quiet=True,
+                        fast=eff_fast, roi_subset=roi_subset if spec.uses_roi_subset else None,
+                        device=dev, robust_crop=ROBUST_CROP, report=str(tmp_report),
+                        resampling_order=RESAMPLING_ORDER,
+                        higher_order_resampling=spec.higher_order,
+                        nr_thr_saving=nr_thr_saving, force_split=split,
+                    )
                 if not tmp_mask.exists():
                     raise RuntimeError("TotalSegmentator finished but produced no output file")
                 used_dev, used_split = dev, split
@@ -1479,7 +1523,7 @@ def parse_tasks(spec_str: str) -> list[TaskSpec]:
 def process_patient(row: dict, source: Path | dict[str, Series], case_id: str, output: Path, *,
                     fast: bool, device: str, min_slices: int, tasks: list[TaskSpec],
                     nr_thr_saving: int, force_split: bool, total_vertebrae: bool = False,
-                    flat: bool = False, recheck: bool = False) -> None:
+                    flat: bool = False, recheck: bool = False, progress=None) -> None:
     """Fills `row` in place, so fields read before an exception survive into the CSV."""
     series = select_series(source, min_slices)
     row.update(read_identity(series, row["folder_id"]))
@@ -1516,6 +1560,8 @@ def process_patient(row: dict, source: Path | dict[str, Series], case_id: str, o
     try:
         roi = total_roi_subset(total_vertebrae)
         for spec in tasks:
+            if progress is not None:
+                progress(spec.name)
             roi_subset = roi if spec.uses_roi_subset else None
             mask: Path | None = None
             if ct_saved:
@@ -1553,6 +1599,8 @@ def process_patient(row: dict, source: Path | dict[str, Series], case_id: str, o
     if not ct_saved:
         notes.append("no CT saved")
 
+    if progress is not None:
+        progress("measuring")
     measurements, warnings = measure_case(ct_path if ct_saved else None, available, series)
     row.update(measurements)
     warnings = notes + warnings
@@ -1564,14 +1612,28 @@ class TqdmLoggingHandler(logging.Handler):
         tqdm.write(self.format(record), file=sys.stderr)
 
 
-def setup_logging(log_path: Path) -> None:
+class ConsoleFilter(logging.Filter):
+    """The console shows case-level progress and anything that went wrong. The
+    log file keeps every line regardless, so --verbose only changes the screen."""
+
+    def __init__(self, verbose: bool) -> None:
+        super().__init__()
+        self.verbose = verbose
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return self.verbose or record.levelno >= logging.WARNING or getattr(record, "console", False)
+
+
+def setup_logging(log_path: Path, verbose: bool = False) -> None:
     if log.handlers:  # guard against duplicate handlers if called twice
         return
-    log.setLevel(logging.INFO)
-    fh = logging.FileHandler(log_path)
+    log.setLevel(logging.DEBUG)
+    fh = logging.FileHandler(log_path, encoding="utf-8")
     fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    fh.setLevel(logging.DEBUG)
     ch = TqdmLoggingHandler()
     ch.setFormatter(logging.Formatter("%(message)s"))
+    ch.addFilter(ConsoleFilter(verbose))
     log.addHandler(fh)
     log.addHandler(ch)
 
@@ -1610,6 +1672,9 @@ def main() -> int:
     ap.add_argument("--flat", action="store_true",
                     help="Input is a single DICOM export (e.g. DICOMDIR + IMAGES folder) with no "
                          "per-patient subfolders: cases are detected by the PatientID inside the files")
+    ap.add_argument("-v", "--verbose", action="store_true",
+                    help="Put everything on the console, including what TotalSegmentator, torch "
+                         "and ITK print. The log file always has it either way")
     ap.add_argument("--rescan", action="store_true",
                     help="With --flat: rebuild the saved index of which files belong to which "
                          "patient. Needed only after adding or moving data")
@@ -1634,12 +1699,15 @@ def main() -> int:
               "(read-only drive? NTFS drives mount read-only on macOS -- "
               "choose an output folder on a writable disk)", file=sys.stderr)
         return 2
-    setup_logging(res_dir / "pipeline.log")
+    global VERBOSE
+    VERBOSE = args.verbose
+    setup_logging(res_dir / "pipeline.log", verbose=args.verbose)
     csv_path = res_dir / "results.csv"
 
-    log.info("INPUT  (read-only): %s", args.input_root.resolve())
-    log.info("OUTPUT            : %s", args.output.resolve())
-    log.info("resolution        : %s -> %s", "fast (3 mm total)" if args.fast else "full (1.5 mm)", res_dir)
+    log.info("INPUT  (read-only): %s", args.input_root.resolve(), extra=SHOW)
+    log.info("OUTPUT            : %s", args.output.resolve(), extra=SHOW)
+    log.info("resolution        : %s -> %s", "fast (3 mm total)" if args.fast else "full (1.5 mm)",
+             res_dir, extra=SHOW)
 
     try:
         check_csv_header(csv_path)
@@ -1650,7 +1718,9 @@ def main() -> int:
         return 2
     disable_usage_stats()
     total_vertebrae = args.total_vertebrae or not any(t.name in VERTEBRA_TASKS for t in tasks)
-    log.info("tasks             : %s", ", ".join(t.name for t in tasks))
+    log.info("device            : %s%s", device, " (auto)" if args.device == "auto" else "",
+             extra=SHOW)
+    log.info("tasks             : %s", ", ".join(t.name for t in tasks), extra=SHOW)
     log.info("vertebrae from    : %s%s",
              next((t.name for t in tasks if t.name in VERTEBRA_TASKS), "total"),
              " (+ total, for the level cross-check)" if total_vertebrae and
@@ -1691,7 +1761,8 @@ def main() -> int:
             try:
                 save_flat_index(flat_index_path(args.output), args.input_root, cases)
                 log.info("flat index saved to %s (%d cases): every later run with this "
-                         "--output skips the scan", flat_index_path(args.output), len(cases))
+                         "--output skips the scan", flat_index_path(args.output), len(cases),
+                         extra=SHOW)
             except OSError as e:
                 log.warning("could not save the flat index (%s); the next run will scan again", e)
         else:
@@ -1711,7 +1782,8 @@ def main() -> int:
     # Upfront roster. A case is NEVER silently skipped -- worst case it gets an
     # error row in results.csv.
     n_ready = 0
-    log.info("=== %d %s found ===", len(cases), kind)
+    detail = show_if(args.verbose or args.dry_run)
+    log.info("=== %d %s found ===", len(cases), kind, extra=detail)
     for i, (case_id, _src) in enumerate(cases, start=1):
         md = masks_dir_for(args.output, case_id)
         have = 0
@@ -1722,31 +1794,46 @@ def main() -> int:
             if any((md / f"{st}.nii.gz").exists() and (md / f"{st}.report.json").exists() for st in stems):
                 have += 1
         n_ready += have == len(tasks)
-        log.info("  %3d/%d  %-40s %d/%d masks present", i, len(cases), case_id, have, len(tasks))
-    log.info("=== %d case(s) complete, %d to segment | device=%s | %d task(s) ===",
-             n_ready, len(cases) - n_ready, device, len(tasks))
+        log.info("  %3d/%d  %-40s %d/%d masks present", i, len(cases), case_id, have, len(tasks),
+                 extra=detail)
+    log.info("=== %d %s: %d already complete, %d to segment ===",
+             len(cases), kind, n_ready, len(cases) - n_ready, extra=SHOW)
 
     if args.dry_run:
-        log.info("--dry-run: verifying DICOM series selection per case (nothing is written)")
+        log.info("--dry-run: verifying DICOM series selection per case (no segmentation)",
+                 extra=SHOW)
         n_bad = 0
         for i, (case_id, src) in enumerate(cases, start=1):
-            log.info("[%d/%d] %s", i, len(cases), case_id)
             try:
                 sr = select_series(src, args.min_slices)
                 ident = read_identity(sr, case_id)
-                log.info("  PatientID=%s  StudyDate=%s",
-                         ident["dicom_patient_id"] or "<missing>", ident["study_date"] or "<missing>")
+                log.info("[%d/%d] %-24s PatientID=%s  StudyDate=%s  %d slices", i, len(cases),
+                         case_id, ident["dicom_patient_id"] or "<missing>",
+                         ident["study_date"] or "<missing>", sr.n_slices, extra=SHOW)
             except Exception as e:
                 n_bad += 1
-                log.error("  PROBLEM: %s", e)
+                log.error("[%d/%d] %-24s PROBLEM: %s", i, len(cases), case_id, e)
         log.info("=== dry-run done: %d/%d cases ok, %d with problems ===",
-                 len(cases) - n_bad, len(cases), n_bad)
+                 len(cases) - n_bad, len(cases), n_bad, extra=SHOW)
         return 0 if n_bad == 0 else 1
 
     n_ok = 0
-    for i, (case_id, src) in enumerate(tqdm(cases, unit="case", desc="patients"), start=1):
+    # The bar only makes sense on a terminal. Redirected to a file it would be
+    # thousands of redraw lines, so it is switched off and each case announces
+    # its start instead.
+    on_screen = sys.stderr.isatty()
+    bar = tqdm(cases, unit="case", file=sys.stderr, leave=True, disable=not on_screen,
+               bar_format="{percentage:3.0f}%|{bar:18}| {n_fmt}/{total_fmt} "
+                          "[{elapsed}<{remaining}] {desc}")
+
+    def step(case: str, task: str) -> None:
+        # Fixed widths keep the line from jittering as the task names change.
+        bar.set_description_str(f"{case[:14]:<14} {task:<26}", refresh=True)
+
+    for i, (case_id, src) in enumerate(bar, start=1):
         t0 = time.monotonic()
-        log.info("[%d/%d] %s", i, len(cases), case_id)
+        step(case_id, "reading series")
+        log.info("[%d/%d] %s", i, len(cases), case_id, extra=show_if(not on_screen))
         row = {c: "" for c in CSV_COLUMNS}
         row["folder_id"] = case_id
         try:
@@ -1754,16 +1841,31 @@ def main() -> int:
                             min_slices=args.min_slices, tasks=tasks,
                             nr_thr_saving=args.nr_thr_saving, force_split=args.force_split,
                             total_vertebrae=total_vertebrae,
-                            flat=args.flat, recheck=args.recheck_geometry)
+                            flat=args.flat, recheck=args.recheck_geometry,
+                            progress=lambda t: step(case_id, t))
             n_ok += 1
         except Exception as e:
-            log.error("  FAILED %s: %s\n%s", case_id, e, traceback.format_exc())
+            log.debug("FAILED %s: %s\n%s", case_id, e, traceback.format_exc())
+            log.error("[%d/%d] %s  FAILED: %s: %s", i, len(cases), case_id,
+                      type(e).__name__, str(e)[:160])
             row["status"] = f"error: {type(e).__name__}: {str(e)[:200]}"
-        row["runtime_s"] = round(time.monotonic() - t0, 1)
+        elapsed = time.monotonic() - t0
+        row["runtime_s"] = round(elapsed, 1)
         append_row(csv_path, row)
-        log.info("  [%d/%d] %s -> %s (%.1fs)", i, len(cases), case_id, row["status"], row["runtime_s"])
+        log.info("  status: %s", row["status"])  # the log file always keeps it in full
+        if not row["status"].startswith("error"):
+            status = row["status"]
+            short = status if len(status) <= 90 else status[:87] + "..."
+            log.info("[%d/%d] %s  %s  (%s)", i, len(cases), case_id, short,
+                     fmt_duration(elapsed), extra=SHOW)
+    bar.close()
 
-    log.info("=== done: %d/%d ok | results: %s ===", n_ok, len(cases), csv_path)
+    n_bad = len(cases) - n_ok
+    log.info("=== done: %d/%d ok%s | results: %s ===", n_ok, len(cases),
+             f", {n_bad} with errors" if n_bad else "", csv_path, extra=SHOW)
+    if n_bad:
+        log.info("    the failed cases are in the status column; rerunning picks them up again",
+                 extra=SHOW)
     return 0
 
 
