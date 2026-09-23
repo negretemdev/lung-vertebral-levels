@@ -322,6 +322,11 @@ class Series:
     patient_id: str = ""
     study_uid: str = ""
     study_date: str = ""
+    # Filled by sort_series_files: how evenly the slices are spaced along the
+    # scan axis. None when the positions could not be read for every file.
+    gap_median_mm: float | None = None
+    gap_max_dev_mm: float | None = None
+    gap_min_mm: float | None = None
 
 
 def _iop_is_axial(ds: pydicom.Dataset) -> bool | None:
@@ -415,17 +420,56 @@ def sort_series_files(s: Series) -> list[Path]:
         if iop is not None and len(iop) == 6 else np.array([0.0, 0.0, 1.0])
     )
 
+    proj: dict[Path, float] = {}
+
     def key(f: Path) -> float:
         try:
             ds = pydicom.dcmread(f, stop_before_pixels=True, specific_tags=["ImagePositionPatient", "InstanceNumber"])
             ipp = getattr(ds, "ImagePositionPatient", None)
             if ipp is not None and len(ipp) == 3:
-                return float(np.dot(np.array(ipp, float), normal))
+                v = float(np.dot(np.array(ipp, float), normal))
+                proj[f] = v
+                return v
             return float(getattr(ds, "InstanceNumber", 0) or 0)
         except Exception:
             return 0.0
 
-    return sorted(s.files, key=key)
+    files = sorted(s.files, key=key)
+    # The slice positions were just read for the sort, so measuring how evenly
+    # the slices are spaced is free. It matters: the volume is built with one
+    # uniform spacing, so an uneven or gappy series is reconstructed slightly
+    # stretched or squashed, and every craniocaudal length comes off that grid.
+    if len(files) > 2 and len(proj) == len(files):
+        gaps = np.diff([proj[f] for f in files])
+        med = float(np.median(gaps))
+        if med > 1e-6:
+            s.gap_median_mm = med
+            s.gap_max_dev_mm = float(np.max(np.abs(gaps - med)))
+            s.gap_min_mm = float(np.min(gaps))
+    return files
+
+
+def slice_spacing_notes(s: Series) -> list[str]:
+    """Warnings about how evenly this series is sampled along the scan axis.
+
+    The volume is reconstructed with a single spacing taken from the first and
+    last slice positions, so the two ends are always right, but a gap or a
+    duplicate in between displaces the slices around it. SimpleITK prints its
+    own "Non uniform sampling" warning for the same thing; this reports it in
+    millimetres and puts it in the case's `status`, where it can be filtered.
+    """
+    med, dev, lo = s.gap_median_mm, s.gap_max_dev_mm, s.gap_min_mm
+    if not med or dev is None:
+        return []
+    notes: list[str] = []
+    if dev > 0.25 * med:
+        missing = " (a slice looks missing)" if dev > 0.75 * med else ""
+        notes.append(f"uneven slice spacing: median {med:.2f} mm, worst gap off by "
+                     f"{dev:.2f} mm{missing}")
+    if lo is not None and lo < 0.25 * med:
+        notes.append(f"overlapping or duplicated slices (smallest gap {lo:.2f} mm "
+                     f"against a median of {med:.2f} mm)")
+    return notes
 
 
 def read_identity(s: Series, folder_id: str) -> dict:
@@ -1448,7 +1492,7 @@ def process_patient(row: dict, source: Path | dict[str, Series], case_id: str, o
     ct_path = output / "ct" / f"{case_id}.nii.gz"
     masks_dir = masks_dir_for(output, case_id)
     files_sorted = sort_series_files(series)
-    notes: list[str] = []
+    notes: list[str] = slice_spacing_notes(series)
 
     if recheck and (ct_path.exists() or masks_dir.exists()):
         if recheck_geometry(files_sorted, ct_path):

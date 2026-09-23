@@ -441,6 +441,8 @@ Besides the vertebra checks, `status` can carry:
 | `level mismatch total vs vertebrae_pp: ...` | the body-based and whole-vertebra levels disagree (body value first). Only with `--total-vertebrae` |
 | `lung HU implausible (...)` | the mean parenchymal attenuation is outside −1000 to −500 HU, so the scan may not be in Hounsfield units |
 | `small-vessel volume unreliable at X mm slices` | slices thicker than 1.5 mm; the BV5 column is not comparable with published values |
+| `uneven slice spacing: ...` | the slices are not evenly spaced along the scan axis. The volume is built with one uniform spacing, so the two ends are right but slices in between are displaced by up to the reported amount. `(a slice looks missing)` is added when one gap is near double the rest. SimpleITK prints its own "Non uniform sampling" warning for the same thing; this one is in millimetres and lands in the CSV |
+| `overlapping or duplicated slices (...)` | two slices share a position, usually a multi-phase series exported as one. Worth opening the case |
 | `no CT saved` | the DICOMs could not be converted, so TotalSegmentator was fed them directly and the density columns stay empty |
 | `<task> failed: ...` | an optional task failed; its columns are empty and the next run retries it. A failure of `total` or the vertebra task makes the whole case an `error:` row |
 | `<task> ran on cpu (mps failed ...)` | the Apple GPU could not run that task, so it ran on the CPU |
@@ -448,6 +450,29 @@ Besides the vertebra checks, `status` can carry:
 
 All numeric values have 2 decimals; with ~2 mm slices the real uncertainty is
 about one slice thickness, so treat sub-millimeter digits as noise.
+
+## Checking a finished run
+
+Every case produces exactly one row, so the roster count and the row count must
+match. Sort the `status` column to triage:
+
+```bash
+# PowerShell: how many of each outcome, worst first
+Import-Csv .\out\full\results.csv | Group-Object status | Sort-Object Count -Descending | Format-Table Count, Name
+
+# just the failures
+Import-Csv .\out\full\results.csv | Where-Object { $_.status -like "error*" } | Format-Table folder_id, dicom_patient_id, status
+```
+
+`ok` alone means nothing was flagged. `ok; ...` means the numbers are there but
+something is worth knowing (see the table above). `error: ...` means the case
+produced no numbers; the log holds the traceback, and rerunning picks it up
+again because finished masks are reused.
+
+Warnings printed by the libraries themselves, such as SimpleITK's
+`Non uniform sampling or missing slices detected`, go to the console but never
+to the CSV. Anything that should influence how a case is read is turned into a
+`status` entry instead, so the CSV alone is enough to triage a batch.
 
 ## Testing without real data
 

@@ -264,6 +264,61 @@ def test_flat_pools_skip_the_multi_patient_check():
 
 
 # ---------------------------------------------------------------------------
+# Slice spacing
+# ---------------------------------------------------------------------------
+
+def _series_with_gaps(gaps_mm):
+    """A Series whose recorded spacing statistics match the given gap sequence."""
+    import numpy as _np
+    g = _np.array(gaps_mm, dtype=float)
+    med = float(_np.median(g))
+    return pl.Series(uid="u", gap_median_mm=med, gap_max_dev_mm=float(_np.max(abs(g - med))),
+                     gap_min_mm=float(g.min()))
+
+
+def test_even_spacing_is_silent():
+    assert pl.slice_spacing_notes(_series_with_gaps([0.8] * 20)) == []
+    # sub-millimetre jitter from rounded positions must not raise anything
+    assert pl.slice_spacing_notes(_series_with_gaps([0.8, 0.81, 0.79, 0.8, 0.8])) == []
+
+
+def test_a_missing_slice_is_reported():
+    notes = pl.slice_spacing_notes(_series_with_gaps([0.8] * 10 + [1.6] + [0.8] * 10))
+    assert len(notes) == 1
+    assert "uneven slice spacing" in notes[0] and "a slice looks missing" in notes[0]
+
+
+def test_moderate_unevenness_is_reported_without_claiming_a_gap():
+    notes = pl.slice_spacing_notes(_series_with_gaps([0.8] * 10 + [1.1] + [0.8] * 10))
+    assert len(notes) == 1
+    assert "uneven slice spacing" in notes[0] and "missing" not in notes[0]
+
+
+def test_duplicated_slices_are_reported():
+    notes = pl.slice_spacing_notes(_series_with_gaps([0.8] * 10 + [0.0] + [0.8] * 10))
+    assert any("overlapping or duplicated slices" in n for n in notes)
+
+
+def test_no_statistics_means_no_claim():
+    assert pl.slice_spacing_notes(pl.Series(uid="u")) == []
+
+
+def test_spacing_is_measured_while_sorting(tmp_path):
+    """The positions are read for the sort anyway, so the statistics come free."""
+    import make_fake_case as mk
+    mk.write_series(tmp_path, None, n_slices=6, axial=True, study_uid="1.2.3",
+                    series_desc="Chest", series_num=1)
+    files = sorted(tmp_path.glob("*.dcm"))
+    s = pl.Series(uid="u", files=files, n_slices=len(files), modality="CT",
+                  first_ds=__import__("pydicom").dcmread(files[0], stop_before_pixels=True))
+    ordered = pl.sort_series_files(s)
+    assert [f.name for f in ordered] == [f.name for f in files]
+    assert s.gap_median_mm == pytest.approx(mk.SPACING[2])
+    assert s.gap_max_dev_mm == pytest.approx(0.0, abs=1e-6)
+    assert pl.slice_spacing_notes(s) == []
+
+
+# ---------------------------------------------------------------------------
 # The flat index: scan once, reuse afterwards
 # ---------------------------------------------------------------------------
 
