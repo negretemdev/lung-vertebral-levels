@@ -208,6 +208,62 @@ def test_mask_file_naming():
 
 
 # ---------------------------------------------------------------------------
+# Multi-patient exports must never be mistaken for one patient
+# ---------------------------------------------------------------------------
+
+def test_dicomdir_found_below_the_root(tmp_path):
+    """The real layout that broke: exports one level down, each with its own
+    DICOMDIR, so a check that only looked at the root saw nothing."""
+    for day in ("2026-09-16-001", "2026-09-16-002"):
+        d = tmp_path / day
+        (d / "IMAGES").mkdir(parents=True)
+        (d / "DICOMDIR").write_bytes(b"\0")
+    found = pl.find_dicomdirs(tmp_path)
+    assert {f.parent.name for f in found} == {"2026-09-16-001", "2026-09-16-002"}
+
+
+def test_dicomdir_at_the_root_and_absent(tmp_path):
+    (tmp_path / "DICOMDIR").write_bytes(b"\0")
+    assert [f.parent for f in pl.find_dicomdirs(tmp_path)] == [tmp_path]
+
+    clean = tmp_path / "clean"
+    (clean / "PAT001" / "series").mkdir(parents=True)
+    assert pl.find_dicomdirs(clean) == []
+
+
+def test_folder_with_several_patients_is_refused(monkeypatch, tmp_path):
+    def fake_scan(_root):
+        return {f"uid{i}": pl.Series(uid=f"uid{i}", files=[Path(f"{i}.dcm")], n_slices=500,
+                                     modality="CT", is_axial=True, patient_id=pid)
+                for i, pid in enumerate(("PAT-A", "PAT-B", "PAT-C"))}
+
+    monkeypatch.setattr(pl, "scan_series", fake_scan)
+    with pytest.raises(RuntimeError) as e:
+        pl.select_series(tmp_path, 20)
+    assert "3 different PatientIDs" in str(e.value)
+    assert "--flat" in str(e.value)
+
+
+def test_single_patient_folder_is_accepted(monkeypatch, tmp_path):
+    def fake_scan(_root):
+        return {"uid1": pl.Series(uid="uid1", files=[Path("a.dcm")], n_slices=500, modality="CT",
+                                  is_axial=True, patient_id="PAT-A"),
+                "uid2": pl.Series(uid="uid2", files=[Path("b.dcm")], n_slices=60, modality="CT",
+                                  is_axial=True, patient_id="")}  # missing tag, not a second patient
+
+    monkeypatch.setattr(pl, "scan_series", fake_scan)
+    assert pl.select_series(tmp_path, 20).uid == "uid1"
+
+
+def test_flat_pools_skip_the_multi_patient_check():
+    """In --flat mode the pool is already one patient, so the check must not fire
+    even though it is handed a dict rather than a folder."""
+    pool = {"uid1": pl.Series(uid="uid1", files=[Path("a.dcm")], n_slices=500, modality="CT",
+                              is_axial=True, patient_id="PAT-A")}
+    assert pl.select_series(pool, 20).uid == "uid1"
+
+
+# ---------------------------------------------------------------------------
 # End to end on the synthetic case
 # ---------------------------------------------------------------------------
 

@@ -101,15 +101,36 @@ exports/                 <- --input, with --flat
     └── ...
 ```
 
+Nesting does not matter. Several exports side by side, one per download date,
+each holding dozens of patients, is the same layout and the same flag:
+
+```
+cohort/                  <- --input, with --flat
+├── 2026-09-16-001/      (one export, ~30 patients)
+│   ├── DICOMDIR
+│   └── IMAGES/
+├── 2026-09-16-002/
+│   ├── DICOMDIR
+│   └── IMAGES/
+└── ...
+```
+
 With `--flat`, folder structure is ignored: every file's header is read and
 cases are grouped by the **PatientID and study stored inside the DICOMs** —
 this works whether the export holds one patient or two hundred. The case id
-(`folder_id` column, segmentation filename) is the PatientID; a second study
-of the same patient becomes `<PatientID>_study2`; `id_mismatch` is only True
-if a file has no PatientID at all. If you forget `--flat` on such a folder,
-the pipeline detects the DICOMDIR and refuses with a hint instead of
-mis-treating `IMAGES` as one patient. Run `--flat --dry-run` first to see the
-detected patient list before segmenting anything.
+(`folder_id` column, and the folder name under `masks/`) is the PatientID; a
+second study of the same patient becomes `<PatientID>_study2`; `id_mismatch` is
+only True if a file has no PatientID at all.
+
+**If you forget `--flat`**, the pipeline looks for a DICOMDIR at the root and a
+few levels below it, and refuses to start when it finds one. Without that check
+each export folder would be taken for a single patient: one patient would be
+segmented and the other thirty silently skipped. As a second line of defence,
+any folder that turns out to hold more than one PatientID produces an `error:`
+row naming the count, rather than a quietly wrong result.
+
+Run `--flat --dry-run` first to see the detected patient list before segmenting
+anything.
 
 - **Input root** (layout 1) = the folder that directly contains one subfolder
   per patient (not a single patient's folder). Every immediate subfolder is

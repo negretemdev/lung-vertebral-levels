@@ -369,6 +369,17 @@ def select_series(source: Path | dict[str, Series], min_slices: int) -> Series:
     series = scan_series(source) if isinstance(source, Path) else source
     if not series:
         raise RuntimeError("no readable DICOM files found")
+    if isinstance(source, Path):
+        # A folder that holds several PatientIDs is an export, not one patient.
+        # Picking the largest series out of it would process one patient and
+        # silently drop the rest, so refuse instead.
+        pids = sorted({s.patient_id for s in series.values() if s.patient_id})
+        if len(pids) > 1:
+            raise RuntimeError(
+                f"this folder holds {len(pids)} different PatientIDs across {len(series)} series, "
+                f"so it is a multi-patient export rather than one patient. Rerun with --flat: "
+                f"cases are then grouped by the PatientID stored inside the files, however the "
+                f"folders are nested.")
     candidates = [s for s in series.values() if s.n_slices >= min_slices]
     if not candidates:
         raise RuntimeError(
@@ -420,6 +431,34 @@ def read_identity(s: Series, folder_id: str) -> dict:
         "study_date": date,
         "id_mismatch": folder_id.strip() != pid,  # missing PatientID also counts as mismatch
     }
+
+
+def find_dicomdirs(root: Path, max_depth: int = 3) -> list[Path]:
+    """DICOMDIR index files at the root or a few levels below it.
+
+    A DICOMDIR marks a PACS or CD export, which usually holds many patients. The
+    search is breadth-first and stops at the first level that has any, so it
+    stays fast on a large tree.
+    """
+    level = [root]
+    for _ in range(max_depth + 1):
+        found: list[Path] = []
+        nxt: list[Path] = []
+        for d in level:
+            try:
+                for child in d.iterdir():
+                    if child.name.upper() == "DICOMDIR" and child.is_file():
+                        found.append(child)
+                    elif child.is_dir() and not child.name.startswith("."):
+                        nxt.append(child)
+            except OSError:
+                continue
+        if found:
+            return found
+        if not nxt:
+            break
+        level = nxt
+    return []
 
 
 def build_flat_cases(input_root: Path) -> list[tuple[str, dict[str, Series]]]:
@@ -1325,6 +1364,9 @@ def process_patient(row: dict, source: Path | dict[str, Series], case_id: str, o
     row.update(read_identity(series, row["folder_id"]))
     if flat:  # case id IS the PatientID here; mismatch only means the tag was missing
         row["id_mismatch"] = row["dicom_patient_id"] == ""
+    log.info("  PatientID=%s  StudyDate=%s  Accession=%s",
+             row["dicom_patient_id"] or "<missing>", row["study_date"] or "<missing>",
+             row["accession_number"] or "<missing>")
 
     ct_path = output / "ct" / f"{case_id}.nii.gz"
     masks_dir = masks_dir_for(output, case_id)
@@ -1494,13 +1536,26 @@ def main() -> int:
                  "top-level results.csv). Those have no run reports, so they are ignored and never "
                  "reused. Nothing is deleted.")
 
-    # Guard against the obviously-wrong mode: a DICOMDIR at the input root means
-    # this is a single flat export, not a folder-per-patient cohort.
-    if not args.flat and any((args.input_root / n).exists() for n in ("DICOMDIR", "dicomdir")):
-        log.error("The input root contains a DICOMDIR: this looks like a single DICOM export, "
-                  "not one folder per patient. Rerun with --flat to group patients by their "
-                  "PatientID inside the files.")
-        return 2
+    # Guard against the obviously-wrong mode: a DICOMDIR anywhere near the top
+    # means these are exports, which usually hold many patients each. Treating
+    # such a folder as one patient would segment one of them and silently drop
+    # the rest, so refuse before spending any time.
+    if not args.flat:
+        dicomdirs = find_dicomdirs(args.input_root)
+        if dicomdirs:
+            where = ", ".join(str(d.parent.relative_to(args.input_root)) or "<the input root>"
+                              for d in dicomdirs[:4])
+            log.error(
+                "Found a DICOMDIR index in: %s%s\n"
+                "A DICOMDIR marks a PACS or CD export, and one export usually holds MANY patients. "
+                "Treating each of those folders as a single patient would process one patient and "
+                "silently skip the others.\n"
+                "Rerun with --flat: every file's header is read once and cases are grouped by the "
+                "PatientID stored inside the files, no matter how the folders are nested.\n"
+                "See the detected patient list first, without segmenting anything:\n"
+                "    --flat --dry-run",
+                where, f" (and {len(dicomdirs) - 4} more)" if len(dicomdirs) > 4 else "")
+            return 2
 
     # Build the case list. A case is (case_id, source) where source is either a
     # patient folder (default mode) or a pre-scanned series pool (--flat).
