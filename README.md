@@ -265,6 +265,14 @@ or writing anything.
   `masks/<id>/<task>.nii.gz` via *Segmentation → Open Segmentation* — they
   overlay voxel-for-voxel. `uv run python test.py --ct ... --seg ...` does the
   same in napari with class names on hover (needs `uv sync --extra viz`).
+- **Restart**: a case that already has a row without an error, and whose masks
+  this run needs are all on disk, is skipped entirely. So a batch interrupted at
+  case 80 resumes at case 80 rather than re-measuring the first 79. Asking for a
+  task that is not there yet still reopens an otherwise finished case, so
+  building the cohort in passes keeps working. `--remeasure` forces everything
+  to be recomputed, which is what you want after changing how a column is
+  measured. `results.csv` stays append-only, because that is what makes it
+  safe to kill the run at any moment.
 - **Resume**: a mask is reused when its run report shows it was made for the
   same task, at the same resolution, with the same class list, and it sits on
   the saved CT's voxel grid. Anything else is redone. A mask without a report is
@@ -318,6 +326,7 @@ Other flags:
 | `--force-split` | process `total` in 3 chunks to use less memory |
 | `--nr-thr-saving N` | nnU-Net export worker processes per model call (default 1) |
 | `-v`, `--verbose` | put everything on the console, including what TotalSegmentator, torch and ITK print. `pipeline.log` has it either way |
+| `--remeasure` | recompute cases that already have a good row in `results.csv`. Needed after changing how a column is measured; a restart does not need it |
 | `--rescan` | with `--flat`, rebuild the saved file index. Needed only after adding or moving data |
 | `--min-slices N` | ignore series with fewer slices (default 20) |
 
@@ -486,7 +495,8 @@ Besides the vertebra checks, `status` can carry:
 | `carina not found (<reason>)` | the airway mask never splits, so the carina and airway columns stay empty. The reason says whether the trunk was lost, never split, or the scan starts below it |
 | `carina from lumen+trachea` | the airway mask alone did not reach the carina, so the trachea from `total` was added to find it |
 | `level mismatch total vs vertebrae_pp: ...` | the body-based and whole-vertebra levels disagree (body value first). Only with `--total-vertebrae` |
-| `lung HU implausible (...)` | the mean parenchymal attenuation is outside −1000 to −500 HU, so the scan may not be in Hounsfield units |
+| `lung attenuation outside the expected range (...)` | mean parenchymal attenuation outside −1000 to −300 HU. Either the scan is not in Hounsfield units, or the lungs are barely aerated. `lung_mean_hu` holds the value: around −800 is a normal aerated adult lung, infants and expiratory scans read denser, and anything near 0 means the rescale never happened |
+| `<task> mask is empty; levels taken from ...` | the vertebral-body model returned nothing for this case. The whole vertebrae from `total` are used instead when the run asked for them; otherwise no level can be read and the case needs `--total-vertebrae` |
 | `small-vessel volume unreliable at X mm slices` | slices thicker than 1.5 mm; the BV5 column is not comparable with published values |
 | `uneven slice spacing: ...` | the slices are not evenly spaced along the scan axis. The volume is built with one uniform spacing, so the two ends are right but slices in between are displaced by up to the reported amount. `(a slice looks missing)` is added when one gap is near double the rest. SimpleITK prints its own "Non uniform sampling" warning for the same thing; this one is in millimetres and lands in the CSV |
 | `overlapping or duplicated slices (...)` | two slices share a position, usually a multi-phase series exported as one. Worth opening the case |

@@ -1235,6 +1235,17 @@ def measure_case(ct_path: Path | None, mask_paths: dict[str, Path],
     if vert_task is not None:
         vdata = _load_mask(mask_paths[vert_task], img).astype(np.int16)
         verts = get_pp_label_map()
+        if not np.isin(vdata, list(verts.values())).any():
+            # The body model found nothing. Say so plainly rather than reporting
+            # "no vertebrae found" per side, and use the whole vertebrae from
+            # `total` when this run asked for them.
+            if np.isin(data, list(verts_total.values())).any():
+                vdata, verts = data, verts_total
+                warnings.append(f"{vert_task} mask is empty; levels taken from the whole "
+                                f"vertebrae in total")
+            else:
+                warnings.append(f"{vert_task} mask is empty, so no levels could be read "
+                                f"(rerun this case with --total-vertebrae)")
     else:
         vdata, verts = data, verts_total
         warnings.append("levels from total (no vertebral-body mask)")
@@ -1466,8 +1477,11 @@ def measure_case(ct_path: Path | None, mask_paths: dict[str, Path],
                 if dens.n_vox:
                     results["lung_mean_hu"] = round(dens.mean_hu, 1)
                     results["laa950_pct"] = round(dens.laa_pct, 2)
-                    if not (-1000.0 <= dens.mean_hu <= -500.0):
-                        warnings.append(f"lung HU implausible ({dens.mean_hu:.0f}); is the CT in Hounsfield units?")
+                    if not (-1000.0 <= dens.mean_hu <= -300.0):
+                        warnings.append(
+                            f"lung attenuation outside the expected range ({dens.mean_hu:.0f} HU): "
+                            f"either the CT is not in Hounsfield units, or the lungs are barely "
+                            f"aerated")
         except Exception as e:
             warnings.append(f"density failed: {type(e).__name__}: {e}")
         del lv, lumen, wall
@@ -1508,6 +1522,40 @@ def measure_case(ct_path: Path | None, mask_paths: dict[str, Path],
 # ---------------------------------------------------------------------------
 # Batch driver
 # ---------------------------------------------------------------------------
+
+def masks_present(output: Path, case_id: str, tasks: list[TaskSpec], fast: bool) -> int:
+    """How many of this run's tasks already have a mask and a report on disk."""
+    md = masks_dir_for(output, case_id)
+    have = 0
+    for spec in tasks:
+        stems = [spec.name]
+        if fast and supports_fast(spec.name):
+            stems.append(f"{spec.name}_fast")
+        if any((md / f"{st}.nii.gz").exists() and (md / f"{st}.report.json").exists() for st in stems):
+            have += 1
+    return have
+
+
+def measured_cases(csv_path: Path) -> set[str]:
+    """Case ids that already have a row without an error.
+
+    results.csv is append-only so a crash can never corrupt it, but that alone
+    would make a restart recompute every finished case. Those rows are the
+    record that the work is done, so the cases behind them are skipped.
+    """
+    if not csv_path.exists() or csv_path.stat().st_size == 0:
+        return set()
+    done: set[str] = set()
+    try:
+        with open(csv_path, newline="") as fh:
+            for row in csv.DictReader(fh):
+                cid = (row.get("folder_id") or "").strip()
+                if cid and not (row.get("status") or "").startswith("error"):
+                    done.add(cid)
+    except OSError as e:
+        log.warning("could not read %s (%s); nothing will be skipped", csv_path, e)
+    return done
+
 
 def check_csv_header(csv_path: Path) -> None:
     """Refuse to append to a results.csv written with a different set of columns.
@@ -1715,6 +1763,9 @@ def main() -> int:
     ap.add_argument("--flat", action="store_true",
                     help="Input is a single DICOM export (e.g. DICOMDIR + IMAGES folder) with no "
                          "per-patient subfolders: cases are detected by the PatientID inside the files")
+    ap.add_argument("--remeasure", action="store_true",
+                    help="Recompute cases that already have a good row in results.csv. Needed after "
+                         "changing how a column is measured; a restart does not need it")
     ap.add_argument("-v", "--verbose", action="store_true",
                     help="Put everything on the console, including what TotalSegmentator, torch "
                          "and ITK print. The log file always has it either way")
@@ -1818,9 +1869,25 @@ def main() -> int:
     if not cases:
         log.error("no %s found in %s", kind, args.input_root)
         return 2
+    # A case is finished when it has a good row AND every task of this run
+    # already has its mask. The second half matters: asking for another task in
+    # a later pass must still reopen a case that is otherwise done.
+    if not (args.remeasure or args.dry_run):
+        done = measured_cases(csv_path)
+        if done:
+            keep = [(cid, src) for cid, src in cases
+                    if not (cid in done and masks_present(args.output, cid, tasks, args.fast) == len(tasks))]
+            if len(keep) != len(cases):
+                log.info("=== %d case(s) already finished in results.csv: skipping "
+                         "(--remeasure to redo them) ===", len(cases) - len(keep), extra=SHOW)
+                cases = keep
+            if not cases:
+                log.info("=== nothing left to do ===", extra=SHOW)
+                return 0
+
     if args.test:
         cases = cases[:2]
-        log.info("--test: limiting to first %d cases", len(cases))
+        log.info("--test: limiting to first %d cases", len(cases), extra=SHOW)
 
     # Upfront roster. A case is NEVER silently skipped -- worst case it gets an
     # error row in results.csv.
@@ -1828,18 +1895,11 @@ def main() -> int:
     detail = show_if(args.verbose or args.dry_run)
     log.info("=== %d %s found ===", len(cases), kind, extra=detail)
     for i, (case_id, _src) in enumerate(cases, start=1):
-        md = masks_dir_for(args.output, case_id)
-        have = 0
-        for spec in tasks:
-            stems = [spec.name]
-            if args.fast and supports_fast(spec.name):
-                stems.append(f"{spec.name}_fast")
-            if any((md / f"{st}.nii.gz").exists() and (md / f"{st}.report.json").exists() for st in stems):
-                have += 1
+        have = masks_present(args.output, case_id, tasks, args.fast)
         n_ready += have == len(tasks)
         log.info("  %3d/%d  %-40s %d/%d masks present", i, len(cases), case_id, have, len(tasks),
                  extra=detail)
-    log.info("=== %d %s: %d already complete, %d to segment ===",
+    log.info("=== %d %s to do: %d only need measuring, %d need segmenting ===",
              len(cases), kind, n_ready, len(cases) - n_ready, extra=SHOW)
 
     if args.dry_run:

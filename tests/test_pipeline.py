@@ -265,6 +265,61 @@ def test_flat_pools_skip_the_multi_patient_check():
 
 
 # ---------------------------------------------------------------------------
+# A restart must not measure finished cases again
+# ---------------------------------------------------------------------------
+
+def _results(csv_path: Path, rows):
+    with open(csv_path, "w", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=pl.CSV_COLUMNS)
+        w.writeheader()
+        for cid, status in rows:
+            r = {c: "" for c in pl.CSV_COLUMNS}
+            r["folder_id"], r["status"] = cid, status
+            w.writerow(r)
+
+
+def test_measured_cases_reads_back_the_good_rows(tmp_path):
+    csv_path = tmp_path / "results.csv"
+    assert pl.measured_cases(csv_path) == set()          # no file yet
+    _results(csv_path, [("A", "ok"),
+                        ("B", "ok; uneven slice spacing: median 0.60 mm"),
+                        ("C", "error: RuntimeError: segmentation contains no lung voxels")])
+    # failures are left out on purpose: a rerun should try them again
+    assert pl.measured_cases(csv_path) == {"A", "B"}
+
+
+def test_masks_present_counts_only_complete_pairs(tmp_path):
+    tasks = pl.parse_tasks("total,trunk_cavities")
+    md = pl.masks_dir_for(tmp_path, "A")
+    md.mkdir(parents=True)
+    assert pl.masks_present(tmp_path, "A", tasks, fast=False) == 0
+    _nifti(md / "total.nii.gz")
+    assert pl.masks_present(tmp_path, "A", tasks, fast=False) == 0   # report missing
+    _report(md / "total.report.json", "total")
+    assert pl.masks_present(tmp_path, "A", tasks, fast=False) == 1
+    _nifti(md / "trunk_cavities.nii.gz")
+    _report(md / "trunk_cavities.report.json", "trunk_cavities")
+    assert pl.masks_present(tmp_path, "A", tasks, fast=False) == 2
+
+
+def test_a_finished_case_is_skipped_but_a_new_task_reopens_it(tmp_path):
+    """Skipping must depend on the masks this run needs, not only on the row:
+    asking for another task later has to reopen an otherwise finished case."""
+    _results(tmp_path / "results.csv", [("A", "ok")])
+    md = pl.masks_dir_for(tmp_path, "A")
+    md.mkdir(parents=True)
+    _nifti(md / "total.nii.gz")
+    _report(md / "total.report.json", "total")
+
+    done = pl.measured_cases(tmp_path / "results.csv")
+    only_total = pl.parse_tasks("total")
+    assert "A" in done and pl.masks_present(tmp_path, "A", only_total, False) == len(only_total)
+
+    with_more = pl.parse_tasks("total,lung_vessels")
+    assert pl.masks_present(tmp_path, "A", with_more, False) < len(with_more)
+
+
+# ---------------------------------------------------------------------------
 # A silent move to the CPU must never stay silent
 # ---------------------------------------------------------------------------
 
