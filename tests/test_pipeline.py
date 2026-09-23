@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import csv
 import json
+import logging
 import sys
 from pathlib import Path
 
@@ -261,6 +262,36 @@ def test_flat_pools_skip_the_multi_patient_check():
     pool = {"uid1": pl.Series(uid="uid1", files=[Path("a.dcm")], n_slices=500, modality="CT",
                               is_axial=True, patient_id="PAT-A")}
     assert pl.select_series(pool, 20).uid == "uid1"
+
+
+# ---------------------------------------------------------------------------
+# A silent move to the CPU must never stay silent
+# ---------------------------------------------------------------------------
+
+def test_cpu_fallback_message_is_repeated_as_a_warning(caplog):
+    """Library output goes to the log file, but a line saying the work left the
+    GPU has to reach the console: otherwise a batch crawls for days unexplained."""
+    with caplog.at_level(logging.DEBUG, logger="pipeline"):
+        with pl.captured_output("total"):
+            print("No GPU detected. Running on CPU. This can be very slow.")
+            print("Predicting part 1 of 2 ...")
+    warnings = [r for r in caplog.records if r.levelno >= 30]
+    assert len(warnings) == 1
+    assert "No GPU detected" in warnings[0].getMessage()
+    # the ordinary line is kept, but only at debug level
+    assert any("Predicting part 1" in r.getMessage() and r.levelno < 30 for r in caplog.records)
+
+
+def test_out_of_memory_is_also_surfaced(caplog):
+    with caplog.at_level(logging.DEBUG, logger="pipeline"):
+        with pl.captured_output("lung_vessels"):
+            print("CUDA out of memory. Tried to allocate 2.00 GiB")
+    assert any(r.levelno >= 30 and "out of memory" in r.getMessage().lower() for r in caplog.records)
+
+
+def test_device_description_names_the_hardware():
+    assert "no GPU in use" in pl.device_description("cpu")
+    assert pl.device_description("mps").startswith("mps")
 
 
 # ---------------------------------------------------------------------------

@@ -189,7 +189,25 @@ tasks             : total, vertebrae_pp_refined, lung_vessels, pleural_pericard_
 ```
 
 The live line names the patient and the task running right now, so a long batch
-never looks stuck. Everything else — the chosen series, each mask reused or
+never looks stuck. The `device` line names the actual hardware, so whether the
+GPU is in use is answered before the first case starts:
+
+```
+device            : gpu - NVIDIA GeForce RTX 4090 Laptop GPU, 16 GB, CUDA 13.0 (auto)
+```
+
+**Low GPU utilisation is normal here.** TotalSegmentator runs the network on the
+GPU but does the resampling, the temporary file writing and the compression on
+the CPU, so the card sits near 100 % in bursts and averages 4–20 % over a case,
+using 3–4 GB. Windows Task Manager hides this by default: its GPU graph shows
+the "3D" engine, while this work appears under "Cuda" or "Compute_0", which you
+have to pick from the dropdown on one of the graphs. `nvidia-smi` is the
+unambiguous check — the python process appears in its process list with its
+memory. Each mask's `.report.json` also records `gpu_peak_gb` after the fact.
+
+If the work ever does fall back to the processor, TotalSegmentator says so, and
+that message is repeated on the console as a warning even though the rest of its
+output is captured into the log. Everything else — the chosen series, each mask reused or
 segmented, and whatever TotalSegmentator, torch and ITK print — goes to
 `pipeline.log`, which always keeps the full detail. `--verbose` puts all of it
 on screen too, for when something needs debugging.

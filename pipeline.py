@@ -56,6 +56,11 @@ log = logging.getLogger("pipeline")
 SHOW = {"console": True}
 VERBOSE = False
 
+# Library output is captured into the log file, but a line matching one of these
+# is repeated on the console: they mean the run is not doing what was asked.
+LIBRARY_ALERTS = ("no gpu detected", "invalid gpu config", "running on the cpu",
+                  "running on cpu", "out of memory")
+
 
 def show_if(cond: bool) -> dict:
     return SHOW if cond else {}
@@ -78,8 +83,13 @@ def captured_output(label: str):
             yield
     finally:
         for line in buf.getvalue().splitlines():
-            if line.strip():
-                log.debug("    [%s] %s", label, line.rstrip())
+            if not line.strip():
+                continue
+            log.debug("    [%s] %s", label, line.rstrip())
+            if any(a in line.lower() for a in LIBRARY_ALERTS):
+                # Never hide a line that says the work quietly moved to the CPU
+                # or ran out of memory: those change the whole run.
+                log.warning("  %s: %s", label, line.strip())
 
 
 def fmt_duration(seconds: float) -> str:
@@ -855,6 +865,25 @@ def resolve_device(arg: str) -> str:
     return arg
 
 
+def device_description(device: str) -> str:
+    """The device with the hardware behind it, e.g.
+    'gpu - NVIDIA GeForce RTX 4090 Laptop GPU, 16 GB, CUDA 13.0'."""
+    try:
+        import torch
+        if device.startswith("gpu"):
+            idx = int(device.split(":")[1]) if ":" in device else 0
+            props = torch.cuda.get_device_properties(idx)
+            return f"{device} - {props.name}, {props.total_memory / 1e9:.0f} GB, CUDA {torch.version.cuda}"
+        if device == "mps":
+            return f"{device} - Apple GPU (Metal)"
+        if device == "cpu":
+            import multiprocessing
+            return f"{device} - {multiprocessing.cpu_count()} threads (no GPU in use)"
+    except Exception:
+        pass
+    return device
+
+
 def disable_usage_stats() -> None:
     """Turn off TotalSegmentator's anonymous usage reporting. Also removes a 5 s
     stall per model call on a machine with no internet access."""
@@ -935,6 +964,12 @@ def run_task(ct_input: Path, spec: TaskSpec, mask_path: Path, report_path: Path,
         for i, (dev, split) in enumerate(attempts):
             tmp_mask.unlink(missing_ok=True)
             tmp_report.unlink(missing_ok=True)
+            if dev.startswith("gpu"):
+                try:
+                    import torch
+                    torch.cuda.reset_peak_memory_stats()
+                except Exception:
+                    pass
             try:
                 with captured_output(spec.name):
                     totalsegmentator(
@@ -964,7 +999,15 @@ def run_task(ct_input: Path, spec: TaskSpec, mask_path: Path, report_path: Path,
             rep = json.loads(tmp_report.read_text()) if tmp_report.exists() else {}
         except Exception:
             rep = {}
+        gpu_peak_gb = None
+        if used_dev.startswith("gpu"):
+            try:
+                import torch
+                gpu_peak_gb = round(torch.cuda.max_memory_allocated() / 1e9, 2)
+            except Exception:
+                pass
         rep["pipeline"] = {
+            "gpu_peak_gb": gpu_peak_gb,
             "resampling_order": RESAMPLING_ORDER,
             "higher_order_resampling": spec.higher_order,
             "robust_crop": ROBUST_CROP,
@@ -1718,8 +1761,8 @@ def main() -> int:
         return 2
     disable_usage_stats()
     total_vertebrae = args.total_vertebrae or not any(t.name in VERTEBRA_TASKS for t in tasks)
-    log.info("device            : %s%s", device, " (auto)" if args.device == "auto" else "",
-             extra=SHOW)
+    log.info("device            : %s%s", device_description(device),
+             " (auto)" if args.device == "auto" else "", extra=SHOW)
     log.info("tasks             : %s", ", ".join(t.name for t in tasks), extra=SHOW)
     log.info("vertebrae from    : %s%s",
              next((t.name for t in tasks if t.name in VERTEBRA_TASKS), "total"),
